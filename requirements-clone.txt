@@ -1,0 +1,6 @@
+# Optional: real voice cloning ("My Voice" workflow).
+# Installs torch + Coqui TTS (large download). The XTTS-v2 model (~2 GB)
+# downloads automatically on first use. Without these, the app falls back
+# to a neural voice and clearly labels the result as "Fallback Voice".
+TTS>=0.22.0
+torch>=2.1.0
