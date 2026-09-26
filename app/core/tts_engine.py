@@ -123,9 +123,16 @@ class TTSEngine:
                 return "The 'qwen_tts' package is not installed."
             if not self._has_model(manager, kind="tts", engine="qwen3"):
                 return "Qwen3-TTS is not installed — download it from the Models screen."
+            if not self.qwen_gpu_present:
+                return (
+                    "No NVIDIA GPU found — Qwen3-TTS will run on the CPU. "
+                    "It is a 1.7B model, so expect it to take minutes per "
+                    "clip instead of seconds, and the Voices screen will not "
+                    "list its languages. Use Piper for fast offline speech."
+                )
             if QWEN_GPU_ONLY and not self.qwen_gpu_present:
                 return "Qwen3-TTS needs an NVIDIA GPU (GPU-only mode is on)."
-            return "Ready"
+            return "Ready — using the NVIDIA GPU."
         return f"Unknown text-to-speech backend '{backend}'."
 
     def set_backend(self, backend: str) -> None:
@@ -141,8 +148,11 @@ class TTSEngine:
             self._mode = self.MODE_PYTTSSX3
 
     def qwen_gpu_ready(self) -> bool:
-        """Qwen3-TTS is usable whenever the ``qwen_tts`` package is installed.
-        It auto-uses an NVIDIA CUDA GPU when present, otherwise the CPU."""
+        """True when Qwen3-TTS can actually run here.
+
+        It needs the ``qwen_tts`` package and a loaded model. An NVIDIA CUDA
+        GPU is used when present; without one it still runs, but on the CPU.
+        """
         if not (self._qwen_available and self._qwen is not None):
             return False
         if QWEN_GPU_ONLY:
@@ -254,7 +264,14 @@ class TTSEngine:
         self._voices = voices
 
     def _load_qwen_voices(self) -> None:
-        """Static tokens, one per Qwen3-TTS supported language (GPU only)."""
+        """Static tokens, one per Qwen3-TTS supported language (GPU only).
+
+        Skipped entirely without a CUDA GPU. Qwen3-TTS 1.7B on a CPU is minutes
+        per clip, so advertising its language list on a machine that has no
+        NVIDIA card only produces voices the user cannot realistically use.
+        """
+        if not self.qwen_gpu_present:
+            return
         if not self.qwen_gpu_ready():
             return
         seen = {v.get("short_name") for v in self._voices}

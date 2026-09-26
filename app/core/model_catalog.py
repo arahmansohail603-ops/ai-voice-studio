@@ -49,6 +49,10 @@ DEFAULT_ALLOWED_HOSTS = frozenset(
         "raw.githubusercontent.com",
         "objects.githubusercontent.com",
         "release-assets.githubusercontent.com",
+        # Alphacephei hosts the official Vosk recognition models, which is what
+        # this app's offline STT depends on. Without it every catalog entry for
+        # Vosk is rejected and the Models screen can install nothing.
+        "alphacephei.com",
     }
 )
 

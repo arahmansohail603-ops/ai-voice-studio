@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib
 import os
 import sys
 from collections.abc import Callable
+from ctypes import wintypes
 from datetime import datetime, timezone
 
 from app import config
@@ -67,16 +69,84 @@ def _preflight() -> bool:
 
 _LINGERING_TASKS: set = set()
 
+#: GetLastError() value Windows returns when a named mutex already exists.
+_ERROR_ALREADY_EXISTS = 183
+
 
 def _single_instance_key() -> str:
     digest = hashlib.sha256(str(config.DATA_DIR).encode("utf-8")).hexdigest()[:16]
     return f"ai-voice-studio-license-{digest}"
 
 
+def _claim_named_mutex(name: str):
+    """Atomically claim ``name`` for this process.
+
+    Returns a holder on success, ``False`` when another instance already holds
+    it, and ``None`` when the mutex API is unavailable so the caller can fall
+    back to the named-pipe probe.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+    except (AttributeError, OSError):
+        return None
+
+    handle = kernel32.CreateMutexW(None, True, f"Local\\{name}")
+    if not handle:
+        return None
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    return _MutexClaim(handle, kernel32)
+
+
+class _MutexClaim:
+    """Holds a named-mutex handle for the lifetime of the process.
+
+    The handle is never released explicitly during normal use: the kernel drops
+    it when the process exits, so a crash cannot leave a stale claim behind and
+    a restart is never blocked by the previous run. :meth:`close` exists for
+    tests and for callers that want to release it early, and matches the
+    ``QLocalServer`` interface this replaces.
+    """
+
+    def __init__(self, handle: int, kernel32) -> None:
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            self._kernel32.CloseHandle(handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - interpreter teardown
+            pass
+
+
 def _claim_single_instance():
     if QLocalServer is None or QLocalSocket is None:
         return True
     key = _single_instance_key()
+    claim = _claim_named_mutex(key)
+    if claim is not None:
+        return claim if claim is not False else None
+    # Fallback for platforms without the mutex API. Two launches inside the
+    # same second used to both probe, both conclude "not running", and the
+    # loser would then call removeServer() -- tearing down the winner's claim
+    # and letting two apps write settings.json at once. Only clear the pipe
+    # after a *second* probe confirms nobody is answering on it.
     probe = QLocalSocket()
     probe.connectToServer(key)
     if probe.waitForConnected(250):
@@ -86,6 +156,12 @@ def _claim_single_instance():
     if not server.listen(key):
         server.close()
         QLocalServer.removeServer(key)
+        recheck = QLocalSocket()
+        recheck.connectToServer(key)
+        taken = recheck.waitForConnected(250)
+        recheck.abort()
+        if taken:
+            return None
         server = QLocalServer()
         if not server.listen(key):
             return None
@@ -542,7 +618,50 @@ def _build_manager() -> LicenseManager:
     return LicenseManager(client, EncryptedLicenseStore())
 
 
+def _notify_already_running() -> None:
+    """Tell the user the app is open instead of exiting without a word."""
+    print(
+        f"{config.APP_NAME} is already running for this data directory.",
+        file=sys.stderr,
+    )
+    if QApplication is None:
+        return
+    try:
+        QApplication.setActiveWindow(None)
+        from PyQt5.QtWidgets import QMessageBox
+
+        QMessageBox.information(
+            None,
+            f"{config.APP_NAME} is already running",
+            f"{config.APP_NAME} is already open.\n\n"
+            "Look for its window in the taskbar. Only one copy can run at a "
+            "time, so that they do not both write to your settings and history.",
+        )
+    except Exception:  # pragma: no cover - never block a clean exit on a dialog
+        pass
+
+
+def _force_utf8_streams() -> None:
+    """Stop non-ASCII text from killing the process on a Windows console.
+
+    Python binds stdout/stderr to the active ANSI code page, which is cp1252
+    here. Writing Urdu to stdout then raises UnicodeEncodeError and takes the
+    whole app down mid-session, while stderr quietly emits ``\\uXXXX`` escapes
+    so the log becomes unreadable. ``backslashreplace`` keeps logging lossless
+    for the characters that still cannot be encoded.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError):  # pragma: no cover - closed/detached stream
+            pass
+
+
 def main() -> int:
+    _force_utf8_streams()
     if not _preflight():
         return 1
 
@@ -568,10 +687,10 @@ def main() -> int:
     application.setApplicationVersion(config.APP_VERSION)
     single_instance = _claim_single_instance()
     if single_instance is None:
-        print(
-            f"{config.APP_NAME} is already running for this data directory.",
-            file=sys.stderr,
-        )
+        # Say so on screen. Exiting silently on a second launch is what made
+        # this look like "the app will not start" -- the user clicks the
+        # shortcut, nothing appears, and no message ever explains why.
+        _notify_already_running()
         return 1
     controller = _LicenseController(manager, application)
     application.aboutToQuit.connect(controller.shutdown)

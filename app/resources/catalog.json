@@ -1,6 +1,118 @@
 {
   "type": "model_catalog",
   "version": 1,
-  "generated_at": "",
-  "models": []
+  "generated_at": "2026-09-26T00:00:00Z",
+  "models": [
+    {
+      "id": "vosk-small-en-us-0.15",
+      "kind": "stt",
+      "name": "Vosk English (US) small",
+      "version": "0.15",
+      "description": "Offline speech recognition for US English. 39.3 MiB.",
+      "engine": "vosk",
+      "languages": [
+        "en-US"
+      ],
+      "requires": [
+        "vosk"
+      ],
+      "install_dir": "vosk-models/small_en-us",
+      "marker_files": [
+        "am",
+        "conf",
+        "graph",
+        "ivector"
+      ],
+      "size_bytes": 41205931,
+      "archive": {
+        "format": "zip",
+        "sha256": "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498",
+        "strip_single_root": true,
+        "max_extracted_bytes": 8589934592
+      },
+      "assets": [
+        {
+          "name": "vosk-model-small-en-us-0.15.zip",
+          "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+          "size_bytes": 41205931,
+          "sha256": "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498",
+          "part": 0
+        }
+      ]
+    },
+    {
+      "id": "vosk-small-hi-0.22",
+      "kind": "stt",
+      "name": "Vosk Hindi small",
+      "version": "0.22",
+      "description": "Offline speech recognition for Hindi. 42.4 MiB.",
+      "engine": "vosk",
+      "languages": [
+        "hi"
+      ],
+      "requires": [
+        "vosk"
+      ],
+      "install_dir": "vosk-models/small_hi",
+      "marker_files": [
+        "am",
+        "conf",
+        "graph",
+        "ivector"
+      ],
+      "size_bytes": 44458845,
+      "archive": {
+        "format": "zip",
+        "sha256": "7c50a10866889f0ac21d912c20537a055a597ed09fc1d3e5bcd798f9f0017e48",
+        "strip_single_root": true,
+        "max_extracted_bytes": 8589934592
+      },
+      "assets": [
+        {
+          "name": "vosk-model-small-hi-0.22.zip",
+          "url": "https://alphacephei.com/vosk/models/vosk-model-small-hi-0.22.zip",
+          "size_bytes": 44458845,
+          "sha256": "7c50a10866889f0ac21d912c20537a055a597ed09fc1d3e5bcd798f9f0017e48",
+          "part": 0
+        }
+      ]
+    },
+    {
+      "id": "vosk-small-ar-0.3",
+      "kind": "stt",
+      "name": "Vosk Arabic small",
+      "version": "0.3",
+      "description": "Offline speech recognition for Arabic. 99.5 MiB.",
+      "engine": "vosk",
+      "languages": [
+        "ar"
+      ],
+      "requires": [
+        "vosk"
+      ],
+      "install_dir": "vosk-models/small_ar",
+      "marker_files": [
+        "am",
+        "conf",
+        "graph",
+        "ivector"
+      ],
+      "size_bytes": 104351896,
+      "archive": {
+        "format": "zip",
+        "sha256": "8696c91f39ec67a08c513845cfac26dbd4e81937be4fba25233e6c5435c18ca9",
+        "strip_single_root": true,
+        "max_extracted_bytes": 8589934592
+      },
+      "assets": [
+        {
+          "name": "vosk-model-small-ar-0.3.zip",
+          "url": "https://alphacephei.com/vosk/models/vosk-model-small-ar-0.3.zip",
+          "size_bytes": 104351896,
+          "sha256": "8696c91f39ec67a08c513845cfac26dbd4e81937be4fba25233e6c5435c18ca9",
+          "part": 0
+        }
+      ]
+    }
+  ]
 }

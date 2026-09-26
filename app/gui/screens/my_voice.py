@@ -445,8 +445,9 @@ class MyVoiceScreen(Screen):
         self._refresh_clone_state()
         if engine == "qwen" and not self.app.qwen_cloner._cuda_available():
             self.toast(
-                "Qwen3-TTS: no NVIDIA GPU — will run on CPU (slow).",
-                "info",
+                "Qwen3-TTS: no NVIDIA GPU found. Cloning will run on the CPU "
+                "and take several minutes per clip — XTTS is much faster here.",
+                "warn",
             )
         else:
             self.toast(f"Clone engine: {label}", "info")
@@ -603,7 +604,31 @@ class MyVoiceScreen(Screen):
                 "Voice cloning unavailable — a neural fallback voice will be used."
             ),
         }.get(state, "")
+        if self._qwen_without_gpu():
+            # Keep this in the persistent status line, not just a toast: a toast
+            # disappears after a few seconds and the user is then left clicking
+            # Clone wondering why it takes minutes.
+            message = (
+                f"{message}  ⚠  No NVIDIA GPU detected — Qwen3-TTS 1.7B will "
+                "run on the CPU and can take several minutes per clip. "
+                "Use the XTTS engine for faster cloning."
+            ).strip()
+            self._apply_clone_state(state, message)
+            self.clone_status_lbl.setStyleSheet(
+                theme.label_style(theme.WARNING, "left")
+            )
+            return
         self._apply_clone_state(state, message)
+
+    def _qwen_without_gpu(self) -> bool:
+        """True when Qwen3-TTS is the active clone engine and CUDA is absent."""
+        settings_engine = self.app.settings.get("clone", "engine", "xtts")
+        cloner = self.app.qwen_cloner
+        if cloner is None or not hasattr(cloner, "_cuda_available"):
+            return False
+        return (
+            settings_engine == "qwen" and not cloner._cuda_available()
+        )
 
     def _apply_clone_state(self, state, message: str) -> None:
         colors = {

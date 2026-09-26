@@ -48,6 +48,47 @@ FLOOR_DELTA = 400.0
 
 _LEVEL_MAX = 32000.0
 
+# Whisper identifies languages by *bare* ISO 639-1 code. The app's own codes are
+# already ISO 639-1, but a saved setting can carry a regional tag such as "ur-PK"
+# or "en-US", and Whisper answers anything that is not a plain code with
+# "ValueError: Unsupported language: ur-pk" from deep inside recognition. The
+# tag therefore has to be stripped before the call.
+WHISPER_LANGUAGE_ALIASES = {
+    # Whisper ships a single Norwegian model under "no"; the app uses the
+    # Bokmal code "nb", which it does not recognise.
+    "nb": "no",
+}
+
+# App language codes that Whisper genuinely has no model for. This is a static
+# list on purpose: asking Whisper costs an import that pulls in torch (~5s),
+# and the answer is needed every time the engine list is refreshed.
+WHISPER_UNSUPPORTED = frozenset({"eo", "ga", "ky", "pb", "zt"})
+
+
+class WhisperUnsupportedError(AppError):
+    """Raised when Whisper has no model for the selected language."""
+
+
+def whisper_language(code: str) -> str:
+    """Normalise an app language code to one Whisper accepts.
+
+    Raises :class:`WhisperUnsupportedError` when Whisper has no model for the
+    language, so the user gets a sentence naming the language instead of a bare
+    "Unsupported language" from the middle of the recognition stack.
+    """
+    base = (code or "").strip().replace("_", "-").split("-")[0].lower()
+    base = WHISPER_LANGUAGE_ALIASES.get(base, base)
+    if not base or base in WHISPER_UNSUPPORTED:
+        from app.config import language_display_name
+
+        name = language_display_name(base) or (code or "that language")
+        raise WhisperUnsupportedError(
+            f"Whisper has no model for {name} ({code}). "
+            "Pick a different language, or install a Vosk model from the "
+            "Models screen if one exists for it."
+        )
+    return base
+
 
 class NoSpeechError(AppError):
     """Raised when the recogniser heard audio but no speech."""
@@ -55,6 +96,11 @@ class NoSpeechError(AppError):
 
 class STTEngine:
     """Live microphone transcription with pluggable recognition backends."""
+
+    #: Whisper model size used for live recognition. "base" is Whisper's own
+    #: default and the smallest multilingual model that still handles Urdu and
+    #: Hindi recognisably; it is downloaded once (~142 MB) and then cached.
+    whisper_model = "base"
 
     def __init__(self, language: str = "en-US", engine: str = "vosk"):
         self.language = language
@@ -93,9 +139,17 @@ class STTEngine:
         engines: list[str] = []
         if module_installed("vosk") and self._vosk.supported_installed(self.language):
             engines.append("vosk")
-        if module_installed("whisper"):
+        if module_installed("whisper") and self._whisper_usable():
             engines.append("whisper")
         return engines
+
+    def _whisper_usable(self) -> bool:
+        """True when Whisper has a model for the selected language."""
+        try:
+            whisper_language(self.language)
+        except WhisperUnsupportedError:
+            return False
+        return True
 
     def is_engine_ready(self, engine: str) -> bool:
         """True when ``engine`` can run for the current language."""
@@ -112,7 +166,12 @@ class STTEngine:
         if engine == "whisper":
             if not module_installed("whisper"):
                 return "The 'whisper' package is not installed."
-            return "Ready"
+            if not self._whisper_usable():
+                try:
+                    whisper_language(self.language)
+                except WhisperUnsupportedError as exc:
+                    return str(exc)
+            return f"Ready (uses the '{self.whisper_model}' model)"
         return f"Unknown speech-recognition engine '{engine}'."
 
     def _recognize_offline(self, audio, on_status=None) -> str:
@@ -124,8 +183,11 @@ class STTEngine:
             sr = soft_import("speech_recognition")
             if sr is None:
                 raise MissingDependencyError("speech_recognition", "SpeechRecognition")
+            language = whisper_language(self.language)
             try:
-                return sr.Recognizer().recognize_whisper(audio, language=self.language)
+                return sr.Recognizer().recognize_whisper(
+                    audio, model=self.whisper_model, language=language
+                )
             except Exception as exc:
                 raise AppError(f"Whisper recognition failed: {exc}") from exc
 

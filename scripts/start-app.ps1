@@ -105,6 +105,39 @@ function Start-LicenseServer {
     Show-StartupError "The license server did not start on $ServerHost`:$ServerPort.`n`n$details`n`nLog: $LogPath"
 }
 
+function Show-Message {
+    param(
+        [string]$Title,
+        [string]$Message,
+        [string]$Icon = 'Information'
+    )
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $style = [System.Windows.Forms.MessageBoxIcon]::$Icon
+        [void][System.Windows.Forms.MessageBox]::Show(
+            $Message,
+            $Title,
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            $style
+        )
+    } catch {
+    }
+}
+
+# Two clicks a moment apart used to run this script twice in parallel: each
+# launcher's health probe missed the other, so each started a license server and
+# an app instance. That is how two copies ended up writing settings.json at the
+# same time. A named mutex makes the check-and-claim atomic, and the kernel
+# releases it when this script exits, so a crash never leaves it stuck.
+$launcherMutex = New-Object System.Threading.Mutex($false, 'Local\AI Voice Studio Launcher')
+if (-not $launcherMutex.WaitOne(0)) {
+    Write-Log 'Another launcher is already starting the app'
+    Show-Message -Title 'AI Voice Studio is starting' `
+        -Message 'Another copy of AI Voice Studio is already starting. Give it a moment before trying again.' `
+        -Icon Information
+    exit 0
+}
+
 Import-DevEnvironment (Join-Path $PSScriptRoot 'license-dev.env')
 Write-Log 'Launcher started'
 
@@ -129,15 +162,23 @@ $process = Start-Process -FilePath $Python `
 
 Start-Sleep -Seconds 4
 if ($process.HasExited) {
+    # WaitForExit() populates ExitCode; reading it straight off a -PassThru
+    # process object can come back empty, which is why the log used to say
+    # "exited with code ." with no number at all.
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
     $details = ''
     if (Test-Path -LiteralPath $stderr) {
         $details = (Get-Content -LiteralPath $stderr -Tail 12) -join "`n"
     }
     if ($details -match 'already running') {
         Write-Log 'AI Voice Studio is already running'
+        Show-Message -Title 'AI Voice Studio is already open' `
+            -Message 'AI Voice Studio is already open. Look for its window in the taskbar.`n`nOnly one copy can run at a time, so that they do not both write to your settings and history.' `
+            -Icon Information
         exit 0
     }
-    Show-StartupError "AI Voice Studio exited with code $($process.ExitCode).`n`n$details`n`nLog: $LogPath"
+    Show-StartupError "AI Voice Studio exited with code $exitCode.`n`n$details`n`nLog: $LogPath"
 }
 
 Write-Log "AI Voice Studio started (pid $($process.Id))"
