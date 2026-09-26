@@ -1,9 +1,19 @@
-"""History screen: filterable list of generated speeches and voice notes."""
 from __future__ import annotations
 
 from pathlib import Path
 
-import customtkinter as ctk
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.gui import theme
 from app.gui.widgets import MethodBadge, Screen
@@ -22,59 +32,74 @@ TYPE_LABELS = {
 class HistoryScreen(Screen):
     def __init__(self, master, app):
         super().__init__(master, app)
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
-
-        # ---------------------------------------------------------- toolbar
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        bar.grid_columnconfigure(2, weight=1)
-
-        self.filter = ctk.CTkSegmentedButton(
-            bar,
-            values=[v for _, v in TYPE_LABELS.items()],
-            command=self._on_filter,
-            font=theme.font(12),
-            selected_color=theme.ACCENT, selected_hover_color=theme.ACCENT_HOVER,
-            fg_color=theme.PANEL_BG,
-        )
-        self.filter.set("All")
-        self.filter.grid(row=0, column=0, sticky="w")
-
-        self.playing_lbl = ctk.CTkLabel(
-            bar, text="", font=theme.font(12), text_color=theme.SUBTEXT, anchor="w",
-        )
-        self.playing_lbl.grid(row=0, column=1, sticky="w", padx=(12, 0))
-
-        self.stop_all_btn = ctk.CTkButton(
-            bar, text="Stop", command=self._stop_all, width=70, height=28,
-            font=theme.font(12), fg_color=theme.INPUT_BG,
-            border_width=1, border_color=theme.BORDER,
-        )
-        self.stop_all_btn.grid(row=0, column=2, sticky="e")
-
-        self.clear_btn = ctk.CTkButton(
-            bar, text="Clear all", command=self._clear_all, width=90, height=28,
-            font=theme.font(12), fg_color=theme.INPUT_BG, text_color=theme.DANGER,
-            border_width=1, border_color=theme.BORDER,
-        )
-        self.clear_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
-
-        # ------------------------------------------------------------ list
-        self.list_frame = ctk.CTkScrollableFrame(
-            self, fg_color=theme.PANEL_BG, corner_radius=12, label_text=""
-        )
-        self.list_frame.grid(row=2, column=0, sticky="nsew")
-        self.list_frame.grid_columnconfigure(0, weight=1)
-
-        self.empty_lbl = ctk.CTkLabel(
-            self, text="", font=theme.font(14), text_color=theme.SUBTEXT,
-        )
-        self.empty_lbl.grid(row=3, column=0, pady=20)
-
         self._filter_key = "all"
+        self._row_counter = 0
 
-    # ------------------------------------------------------------ lifecycle
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        bar = QFrame(self)
+        bar.setStyleSheet("QFrame { background: transparent; border: none; }")
+        bar_layout = QVBoxLayout(bar)
+        bar_layout.setContentsMargins(0, 0, 0, 0)
+        controls = QWidget(bar)
+        controls_layout = QHBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.filter = QComboBox(controls)
+        self.filter.addItems([value for _, value in TYPE_LABELS.items()])
+        self.filter.setFont(theme.font(12))
+        self.filter.setFixedWidth(170)
+        self.filter.setStyleSheet(theme.combo_style())
+        self.filter.currentTextChanged.connect(self._on_filter)
+        controls_layout.addWidget(self.filter)
+        self.playing_lbl = QLabel("", controls)
+        self.playing_lbl.setFont(theme.font(12))
+        self.playing_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        controls_layout.addWidget(self.playing_lbl, 1)
+        self.stop_all_btn = QPushButton("Stop", controls)
+        self.stop_all_btn.setFixedSize(70, 28)
+        self.stop_all_btn.setFont(theme.font(12))
+        self.stop_all_btn.setStyleSheet(
+            theme.button_style(
+                theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 8, theme.BORDER, 1
+            )
+        )
+        self.stop_all_btn.clicked.connect(self._stop_all)
+        controls_layout.addWidget(self.stop_all_btn)
+        self.clear_btn = QPushButton("Clear all", controls)
+        self.clear_btn.setFixedSize(90, 28)
+        self.clear_btn.setFont(theme.font(12))
+        self.clear_btn.setStyleSheet(
+            theme.button_style(
+                theme.INPUT_BG, theme.CARD_BG, theme.DANGER, 8, theme.BORDER, 1
+            )
+        )
+        self.clear_btn.clicked.connect(self._clear_all)
+        controls_layout.addWidget(self.clear_btn)
+        bar_layout.addWidget(controls)
+        root.addWidget(bar)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setStyleSheet(theme.scroll_style(theme.PANEL_BG))
+        self.list_frame = QWidget()
+        self.list_frame.setStyleSheet(theme.frame_style(theme.PANEL_BG, 12))
+        self.list_layout = QVBoxLayout(self.list_frame)
+        self.list_layout.setContentsMargins(8, 8, 8, 8)
+        self.list_layout.setSpacing(8)
+        self.list_layout.addStretch(1)
+        self.scroll.setWidget(self.list_frame)
+        root.addWidget(self.scroll, 1)
+
+        self.empty_lbl = QLabel("", self)
+        self.empty_lbl.setAlignment(Qt.AlignCenter)
+        self.empty_lbl.setFont(theme.font(14))
+        self.empty_lbl.setWordWrap(True)
+        self.empty_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "center"))
+        root.addWidget(self.empty_lbl)
+
     def on_show(self, **kwargs) -> None:
         self.rebuild(self._filter_key)
 
@@ -82,73 +107,107 @@ class HistoryScreen(Screen):
         if self.app.player is not None:
             self.app.player.stop()
 
-    # ------------------------------------------------------------ filtering
     def _on_filter(self, value: str) -> None:
-        key = {"All": "all", "Text to Speech": "tts", "Voice Notes": "note",
-               "Transcripts": "transcript", "Voice Clone": "clone"}.get(value, "all")
+        key = {
+            "All": "all",
+            "Text to Speech": "tts",
+            "Voice Notes": "note",
+            "Transcripts": "transcript",
+            "Voice Clone": "clone",
+        }.get(value, "all")
         self.rebuild(key)
 
     def rebuild(self, entry_type: str = "all") -> None:
         self._filter_key = entry_type
         self._row_counter = 0
-        for child in self.list_frame.winfo_children():
-            child.destroy()
-
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
         entries = self.app.history.filter(entry_type)
-        self.empty_lbl.configure(text="")
+        self.empty_lbl.setText("")
         if not entries:
-            self.empty_lbl.configure(
-                text="Nothing here yet. Generate speech, record a note or transcribe later."
+            self.empty_lbl.setText(
+                "Nothing here yet. Generate speech, record a note or transcribe later."
             )
+            self.list_layout.addStretch(1)
             return
         for entry in entries:
             self._add_card(entry)
 
-    # --------------------------------------------------------------- cards
     def _add_card(self, entry: HistoryEntry) -> None:
-        card = ctk.CTkFrame(self.list_frame, fg_color=theme.CARD_BG, corner_radius=10)
-        card.grid(row=self._row_counter, column=0, sticky="ew", padx=8, pady=4)
-        self._row_counter += 1
-        card.grid_columnconfigure(1, weight=1)
-
-        MethodBadge(card, entry.method).grid(row=0, column=0, rowspan=2, padx=(12, 10), pady=10)
-
-        title = entry.title or entry.type
-        ctk.CTkLabel(
-            card, text=title[:70], font=theme.font(14, "bold"),
-            text_color=theme.TEXT, anchor="w",
-        ).grid(row=0, column=1, sticky="w", pady=(8, 0))
-
+        card = QFrame(self.list_frame)
+        card.setStyleSheet(theme.frame_style(theme.CARD_BG, 10))
+        card_layout = QVBoxLayout(card)
+        self.list_layout.addWidget(card)
+        card_layout.setContentsMargins(12, 8, 12, 8)
+        card_layout.setSpacing(2)
+        badge = MethodBadge(card, entry.method)
+        top = QWidget(card)
+        top.setStyleSheet("QWidget { background: transparent; border: none; }")
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(2)
+        title = QLabel((entry.title or entry.type)[:70], top)
+        title.setFont(theme.font(14, "bold"))
+        title.setWordWrap(True)
+        title.setStyleSheet(theme.label_style(theme.TEXT, "left"))
+        top_layout.addWidget(badge, 0, Qt.AlignLeft)
+        top_layout.addWidget(title)
         timestamp = entry.ts.replace("T", "  ")
         exists = self._file_exists(entry.file)
         extra = f"  ·  {entry.duration:.1f}s" if entry.duration else ""
         file_line = (Path(entry.file).name if entry.file else "") or "in-app only"
         state = "" if exists else "  ·  file missing"
-        ctk.CTkLabel(
-            card, text=f"{timestamp}  ·  {file_line}{extra}{state}",
-            font=theme.font(12), text_color=theme.DANGER if not exists else theme.SUBTEXT, anchor="w",
-        ).grid(row=1, column=1, sticky="w", pady=(0, 8))
+        metadata = QLabel(f"{timestamp}  ·  {file_line}{extra}{state}", top)
+        metadata.setFont(theme.font(12))
+        metadata.setStyleSheet(
+            theme.label_style(theme.SUBTEXT if exists else theme.DANGER, "left")
+        )
+        top_layout.addWidget(metadata)
+        card_layout.addWidget(top)
 
+        actions = QWidget(card)
+        actions.setStyleSheet("QWidget { background: transparent; border: none; }")
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
         if exists and entry.file:
-            play_btn = ctk.CTkButton(
-                card, text="Play", width=70, height=28, font=theme.font(12),
-                command=lambda e=entry: self._play(e),
-                fg_color=theme.INPUT_BG, border_width=1, border_color=theme.BORDER,
+            play_btn = QPushButton("Play", actions)
+            play_btn.setFixedSize(70, 28)
+            play_btn.setFont(theme.font(12))
+            play_btn.setStyleSheet(
+                theme.button_style(
+                    theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 8, theme.BORDER, 1
+                )
+            )
+            play_btn.clicked.connect(
+                lambda _checked=False, item=entry: self._play(item)
             )
         else:
-            play_btn = ctk.CTkButton(
-                card, text="Play", width=70, height=28, font=theme.font(12), state="disabled",
-                fg_color=theme.INPUT_BG,
+            play_btn = QPushButton("Play", actions)
+            play_btn.setFixedSize(70, 28)
+            play_btn.setEnabled(False)
+            play_btn.setFont(theme.font(12))
+            play_btn.setStyleSheet(
+                theme.button_style(
+                    theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 8, theme.BORDER, 1
+                )
             )
-        play_btn.grid(row=0, column=2, rowspan=2, padx=(8, 6), pady=10)
-
-        del_btn = ctk.CTkButton(
-            card, text="Delete", width=70, height=28, font=theme.font(12),
-            text_color=theme.DANGER, fg_color=theme.INPUT_BG,
-            border_width=1, border_color=theme.BORDER,
-            command=lambda e=entry: self._delete(e),
+        actions_layout.addWidget(play_btn, 0, Qt.AlignRight)
+        delete_btn = QPushButton("Delete", actions)
+        delete_btn.setFixedSize(70, 28)
+        delete_btn.setFont(theme.font(12))
+        delete_btn.setStyleSheet(
+            theme.button_style(
+                theme.INPUT_BG, theme.CARD_BG, theme.DANGER, 8, theme.BORDER, 1
+            )
         )
-        del_btn.grid(row=0, column=3, rowspan=2, padx=(0, 12), pady=10)
+        delete_btn.clicked.connect(
+            lambda _checked=False, item=entry: self._delete(item)
+        )
+        actions_layout.addWidget(delete_btn, 0, Qt.AlignRight)
+        card_layout.addWidget(actions)
 
     @staticmethod
     def _file_exists(file_ref: str) -> bool:
@@ -159,7 +218,6 @@ class HistoryScreen(Screen):
         except Exception:
             return False
 
-    # ------------------------------------------------------------- actions
     def _play(self, entry: HistoryEntry) -> None:
         if self.app.player is None:
             self.toast("Playback unavailable (no audio output device).", "warn")
@@ -168,17 +226,16 @@ class HistoryScreen(Screen):
         try:
             self.app.player.load(path)
             self.app.player.play()
-            self.playing_lbl.configure(
-                text=f"Playing: {path.name}   [stop on another screen]",
-                text_color=theme.SUCCESS,
-            )
+            self.playing_lbl.setText(f"Playing: {path.name}   [stop on another screen]")
+            self.playing_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         except Exception as exc:
             self.toast(str(exc), "error")
 
     def _stop_all(self) -> None:
         if self.app.player is not None:
             self.app.player.stop()
-        self.playing_lbl.configure(text="", text_color=theme.SUBTEXT)
+        self.playing_lbl.setText("")
+        self.playing_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
 
     def _delete(self, entry: HistoryEntry) -> None:
         self.app.history.delete(entry.id)
@@ -186,11 +243,14 @@ class HistoryScreen(Screen):
         self.toast("Entry removed from history.", "info")
 
     def _clear_all(self) -> None:
-        from tkinter import messagebox
-
-        if not messagebox.askyesno(
-            "Clear history", "Remove all history entries? (Files on disk are kept.)"
-        ):
+        answer = QMessageBox.question(
+            self,
+            "Clear history",
+            "Remove all history entries? (Files on disk are kept.)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         self.app.history.clear()
         self.rebuild(self._filter_key)

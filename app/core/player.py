@@ -6,8 +6,8 @@ manually because the mixer does not expose a reliable absolute playhead.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 from app.core.errors import DeviceError, MissingDependencyError, soft_import
 
@@ -24,12 +24,12 @@ class AudioPlayer:
         self._sound = None
         self._channel = None
         self._state = self.IDLE
-        self._path: Optional[Path] = None
+        self._path: Path | None = None
         self._duration = 0.0
         self._base = 0.0          # seconds completed before the current run
         self._run_started = 0.0   # monotonic when the current run began
         self._ended = False
-        self.on_end: Optional[Callable[[], None]] = None
+        self.on_end: Callable[[], None] | None = None
         self._ensure_backend()
 
     # ------------------------------------------------------------------ init
@@ -65,7 +65,7 @@ class AudioPlayer:
         return self._state
 
     @property
-    def path(self) -> Optional[Path]:
+    def path(self) -> Path | None:
         return self._path
 
     @property

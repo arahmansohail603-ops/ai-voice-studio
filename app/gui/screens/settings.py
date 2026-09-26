@@ -1,13 +1,29 @@
-"""Settings screen: defaults, devices, storage and data management."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-import customtkinter as ctk
+from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
-from app.config import language_display_name
+from app.config import STT_LANGUAGES, language_display_name
 from app.core import audio_utils
+from app.core.errors import module_installed
 from app.core.recorder import Recorder, list_input_devices
 from app.core.stt_engine import STTEngine
 from app.gui import theme
@@ -15,218 +31,400 @@ from app.gui.widgets import Screen
 from app.services import file_service
 
 
+class _Value:
+    def __init__(self, value=""):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+    def set(self, value) -> None:
+        self._value = str(value)
+
+
 class SettingsScreen(Screen):
     def __init__(self, master, app):
         super().__init__(master, app)
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.scroll.grid(row=1, column=0, sticky="nsew")
-        self.scroll.grid_columnconfigure(0, weight=1)
-
-        self._row = -1
-        self._cols: dict = {}
         self._lang_map = {}
         self._voice_map = {}
         self._device_map = {}
         self._fallback_map = {}
+        self._card_layouts = {}
+        self._backend_labels = {
+            "system": "System voices (offline)",
+            "piper": "Piper (offline)",
+            "qwen3": "Qwen3-TTS (local — CPU may be slow)",
+        }
+        self._backend_map = {value: key for key, value in self._backend_labels.items()}
+        self._clone_engine_labels = {
+            "xtts": "Coqui XTTS-v2 (default)",
+            "qwen": "Qwen3-TTS 1.7B Base",
+        }
+        self._clone_engine_map = {
+            value: key for key, value in self._clone_engine_labels.items()
+        }
 
-        # ------------------------------------------------------- speech
-        self._section("Speech defaults")
-        r = self._row_frame()
-        self.lang_menu = self._menu(r, 170, self._on_default_lang)
-        self._field_label(r, "Default language")
-        self.voice_menu = self._menu(r, 270, self._on_default_voice)
-        self._field_label(r, "Default voice")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(theme.scroll_style(theme.APP_BG))
+        self.content = QWidget()
+        self.content.setStyleSheet("QWidget { background: transparent; }")
+        self.content_layout = QGridLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setHorizontalSpacing(8)
+        self.content_layout.setVerticalSpacing(8)
+        self.content_layout.setColumnStretch(0, 1)
+        self.content_layout.setColumnStretch(1, 1)
+        self.content_layout.setRowStretch(0, 1)
+        self.content_layout.setRowStretch(1, 1)
+        self.content_layout.setRowStretch(2, 1)
+        scroll.setWidget(self.content)
+        root.addWidget(scroll)
 
-        # ---------------------------------------------------------- stt
-        self._section("Speech-to-text")
-        r = self._row_frame()
-        self.stt_engine_menu = self._menu(r, 150, self._on_stt_engine)
-        self._field_label(r, "Recognition engine")
+        card = self._card("Speech defaults", 0, 0)
+        self.lang_menu = self._menu(card, self._on_default_lang)
+        self._field(card, "Default language", self.lang_menu, 170)
+        self.voice_menu = self._menu(card, self._on_default_voice)
+        self._field(card, "Default voice", self.voice_menu, 200)
+        self.backend_menu = self._menu(card, self._on_tts_backend)
+        self._field(card, "Speech engine", self.backend_menu, 190)
+        self.qwen_gpu_lbl = QLabel("", card)
+        self.qwen_gpu_lbl.setFont(theme.font(11))
+        self.qwen_gpu_lbl.setWordWrap(True)
+        self.qwen_gpu_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+        self._card_layouts[id(card)].addWidget(self.qwen_gpu_lbl, self._card_row, 0)
+        self._card_row += 1
+        self.qwen_ref_var = _Value()
+        self.qwen_ref_entry = QLineEdit(card)
+        self.qwen_ref_entry.setReadOnly(True)
+        self.qwen_ref_entry.setStyleSheet(theme.input_style())
+        qwen_browse = QPushButton("Browse…", card)
+        self._style_button(qwen_browse, width=88, height=30)
+        qwen_browse.clicked.connect(self._on_qwen_ref_browse)
+        self._row_field(
+            card,
+            "Qwen3-TTS reference voice (optional)",
+            self.qwen_ref_entry,
+            qwen_browse,
+        )
+        self._fill_gap(card)
+
+        card = self._card("Speech-to-text", 0, 1)
+        self._stt_lang_map = {
+            f"{language_display_name(language)} ({language})": language
+            for language in STT_LANGUAGES
+        }
+        self.stt_engine_menu = self._menu(card, self._on_stt_engine)
+        self._field(card, "Recognition engine", self.stt_engine_menu, 150)
         self.stt_lang_menu = self._menu(
-            r, 150, self._on_stt_lang,
-            ["en-US", "en-GB", "es-ES", "fr-FR", "de-DE", "it-IT", "pt-BR",
-             "hi-IN", "ja-JP", "ko-KR", "zh-CN", "ar-SA", "ru-RU", "nl-NL"],
+            card, self._on_stt_lang, list(self._stt_lang_map)
         )
-        self._field_label(r, "Recognition language")
+        self._field(card, "Recognition language", self.stt_lang_menu, 170)
+        self._fill_gap(card)
 
-        # ------------------------------------------------------- recorder
-        self._section("Microphone")
-        r = self._row_frame()
-        self.device_menu = self._menu(r, 320, self._on_device)
-        self._field_label(r, "Input device")
+        card = self._card("Microphone", 1, 0)
+        self.device_menu = self._menu(card, self._on_device)
+        self._field(card, "Input device", self.device_menu, 200)
         self.rate_menu = self._menu(
-            r, 110, self._on_rate,
-            ["8000", "16000", "22050", "44100", "48000"],
+            card, self._on_rate, ["8000", "16000", "22050", "44100", "48000"]
         )
-        self._field_label(r, "Sample rate (Hz)")
+        self._field(card, "Sample rate (Hz)", self.rate_menu, 110)
+        self._fill_gap(card)
 
-        # ------------------------------------------------------- output
-        self._section("Output & storage")
-        r = self._row_frame()
-        self.folder_var = ctk.StringVar()
-        self.folder_entry = ctk.CTkEntry(
-            r, textvariable=self.folder_var, width=400, state="readonly",
-            fg_color=theme.INPUT_BG, border_color=theme.BORDER, font=theme.font(13),
+        card = self._card("Output & storage", 1, 1)
+        self.folder_var = _Value()
+        self.folder_entry = QLineEdit(card)
+        self.folder_entry.setReadOnly(True)
+        self.folder_entry.setStyleSheet(theme.input_style())
+        browse = QPushButton("Browse…", card)
+        self._style_button(browse, width=90, height=32)
+        browse.clicked.connect(self._choose_folder)
+        self._row_field(card, "Output folder", self.folder_entry, browse)
+        self.ffmpeg_lbl = QLabel("", card)
+        self.ffmpeg_lbl.setFont(theme.font(11))
+        self.ffmpeg_lbl.setWordWrap(True)
+        self.ffmpeg_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        self._card_layouts[id(card)].addWidget(self.ffmpeg_lbl, self._card_row, 0)
+        self._card_row += 1
+        self._fill_gap(card)
+
+        card = self._card("My Voice (voice cloning)", 2, 0)
+        self.clone_engine_menu = self._menu(card, self._on_clone_engine)
+        self._field(card, "Clone engine", self.clone_engine_menu, 200)
+        self.fallback_voice_menu = self._menu(card, self._on_fallback_voice)
+        self._field(
+            card,
+            "Fallback offline voice",
+            self.fallback_voice_menu,
+            200,
         )
-        self.folder_entry.grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        ctk.CTkButton(
-            r, text="Browse…", command=self._choose_folder, width=90, height=32,
-            font=theme.font(12), fg_color=theme.INPUT_BG,
-            border_width=1, border_color=theme.BORDER,
-        ).grid(row=0, column=1, sticky="w", padx=(4, 12), pady=6)
-        self.ffmpeg_lbl = ctk.CTkLabel(
-            r, text="", font=theme.font(11), text_color=theme.SUBTEXT, anchor="w",
+        self.clone_switch = QCheckBox(
+            "Enable voice cloning (heavy / experimental)", card
         )
-        self.ffmpeg_lbl.grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 8))
-
-        # ------------------------------------------------------- my voice
-        self._section("My Voice (voice cloning)")
-        r = self._row_frame()
-        self.fallback_voice_menu = self._menu(r, 320, self._on_fallback_voice)
-        self._field_label(r, "Fallback neural voice")
-
-        # --------------------------------------------------------- data
-        self._section("Data")
-        r = self._row_frame()
-        ctk.CTkButton(
-            r, text="Open data folder", command=self._open_data_folder, width=150, height=34,
-            font=theme.font(13), fg_color=theme.INPUT_BG,
-            border_width=1, border_color=theme.BORDER,
-        ).grid(row=0, column=0, sticky="w", padx=8, pady=8)
-        ctk.CTkButton(
-            r, text="Reset settings", command=self._reset_settings, width=130, height=34,
-            font=theme.font(13), text_color=theme.WARNING, fg_color=theme.INPUT_BG,
-            border_width=1, border_color=theme.BORDER,
-        ).grid(row=0, column=1, sticky="w", padx=8, pady=8)
-        ctk.CTkLabel(
-            r, text="History and settings live in the data folder. Deleting history "
-                    "keeps audio files on disk.",
-            font=theme.font(11), text_color=theme.SUBTEXT, anchor="w",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 8))
-
-    # -------------------------------------------------------- layout helpers
-    def _section(self, text: str) -> None:
-        self._row += 1
-        ctk.CTkLabel(
-            self.scroll, text=text, font=theme.font(15, "bold"),
-            text_color=theme.TEXT, anchor="w",
-        ).grid(row=self._row, column=0, sticky="w", pady=(16, 2), padx=8)
-
-    def _row_frame(self):
-        self._row += 1
-        frame = ctk.CTkFrame(self.scroll, fg_color=theme.PANEL_BG, corner_radius=10)
-        frame.grid(row=self._row, column=0, sticky="ew", pady=2)
-        frame.grid_columnconfigure(4, weight=1)
-        return frame
-
-    def _field_label(self, row, text: str) -> None:
-        col = max(0, self._cols.get(id(row), 0) - 1)
-        ctk.CTkLabel(
-            row, text=text, font=theme.font(11), text_color=theme.SUBTEXT,
-        ).grid(row=1, column=col, sticky="w", padx=(8, 2), pady=(0, 6))
-
-    def _menu(self, row, width, command, values=None):
-        menu = ctk.CTkOptionMenu(
-            row, values=values or ["Loading…"], width=width, dynamic_resizing=False,
-            command=command, fg_color=theme.INPUT_BG, button_color=theme.ACCENT,
-            button_hover_color=theme.ACCENT_HOVER, font=theme.font(13),
+        self.clone_switch.setFont(theme.font(12))
+        self.clone_switch.setStyleSheet(theme.check_style())
+        self.clone_switch.toggled.connect(self._on_clone_toggle)
+        self._card_layouts[id(card)].addWidget(
+            self.clone_switch, self._card_row, 0, Qt.AlignLeft
         )
-        col = self._cols[id(row)] = self._cols.get(id(row), 0)
-        menu.grid(row=0, column=col, sticky="w", padx=8, pady=6)
-        self._cols[id(row)] = col + 1
-        return menu
+        self._card_row += 1
+        self._fill_gap(card)
 
-    # ------------------------------------------------------------ lifecycle
+        card = self._card("Data", 2, 1)
+        data_row = QFrame(card)
+        data_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        data_layout = QHBoxLayout(data_row)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        open_button = QPushButton("Open data folder", data_row)
+        self._style_button(open_button, width=150, height=34)
+        open_button.clicked.connect(self._open_data_folder)
+        data_layout.addWidget(open_button)
+        reset_button = QPushButton("Reset settings", data_row)
+        self._style_button(reset_button, width=130, height=34, color=theme.WARNING)
+        reset_button.clicked.connect(self._reset_settings)
+        data_layout.addWidget(reset_button)
+        data_layout.addStretch(1)
+        self._card_layouts[id(card)].addWidget(data_row, self._card_row, 0)
+        self._card_row += 1
+        data_note = QLabel(
+            "History and settings live in the data folder. "
+            "Deleting history keeps audio files on disk.",
+            card,
+        )
+        data_note.setFont(theme.font(11))
+        data_note.setWordWrap(True)
+        data_note.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        self._card_layouts[id(card)].addWidget(data_note, self._card_row, 0)
+        self._card_row += 1
+        self._fill_gap(card)
+
+    def _card(self, title: str, row: int, column: int) -> QFrame:
+        card = QFrame(self.content)
+        card.setStyleSheet(theme.frame_style(theme.PANEL_BG, 12))
+        self.content_layout.addWidget(card, row, column)
+        layout = QGridLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
+        title_label = QLabel(title, card)
+        title_label.setFont(theme.font(14, "bold"))
+        title_label.setStyleSheet(theme.label_style(theme.TEXT, "left"))
+        layout.addWidget(title_label, 0, 0)
+        self._card_layouts[id(card)] = layout
+        self._card_row = 1
+        return card
+
+    def _fill_gap(self, card: QFrame) -> None:
+        self._card_layouts[id(card)].setRowStretch(self._card_row, 1)
+
+    def _menu(self, card, command, values=None) -> QComboBox:
+        combo = QComboBox(card)
+        combo.addItems(list(values or ["Loading…"]))
+        combo.setFont(theme.font(13))
+        combo.setStyleSheet(theme.combo_style())
+        combo.currentTextChanged.connect(command)
+        return combo
+
+    def _field(self, card, text: str, widget, menu_width: int | None = None) -> None:
+        if menu_width is not None:
+            widget.setFixedWidth(menu_width)
+        label = QLabel(text, card)
+        label.setFont(theme.font(11))
+        label.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        layout = self._card_layouts[id(card)]
+        layout.addWidget(label, self._card_row, 0)
+        self._card_row += 1
+        layout.addWidget(widget, self._card_row, 0)
+        self._card_row += 1
+
+    def _row_field(self, card, text: str, entry, button) -> None:
+        layout = self._card_layouts[id(card)]
+        label = QLabel(text, card)
+        label.setFont(theme.font(11))
+        label.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        layout.addWidget(label, self._card_row, 0)
+        self._card_row += 1
+        row = QFrame(card)
+        row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        entry.setParent(row)
+        button.setParent(row)
+        row_layout.addWidget(entry, 1)
+        row_layout.addWidget(button, 0)
+        layout.addWidget(row, self._card_row, 0)
+        self._card_row += 1
+
+    @staticmethod
+    def _style_button(
+        button: QPushButton, width: int, height: int, color: str = theme.TEXT
+    ) -> None:
+        button.setFixedSize(width, height)
+        button.setFont(theme.font(12))
+        button.setStyleSheet(
+            theme.button_style(theme.INPUT_BG, theme.CARD_BG, color, 8, theme.BORDER, 1)
+        )
+
     def on_show(self, **kwargs) -> None:
-        self._cols = {}
         self._populate_all()
 
     def _populate_all(self) -> None:
-        s = self.app.settings
-        langs = self.app.tts.languages()
+        settings = self.app.settings
+        languages = self.app.tts.languages()
         self._lang_map = {
-            f"{language_display_name(l)} ({l})": l for l in sorted(langs)
-        } if langs else {}
+            f"{language_display_name(language)} ({language})": language
+            for language in sorted(languages)
+        }
         if self._lang_map:
-            self.lang_menu.configure(values=list(self._lang_map))
-            saved_lang = s.get("tts", "language", "en")
-            sel = next((k for k, v in self._lang_map.items() if v == saved_lang), None)
-            self.lang_menu.set(sel if sel else next(iter(self._lang_map)))
-            self._populate_default_voices(saved_lang)
+            self._set_items(self.lang_menu, list(self._lang_map))
+            saved_language = settings.get("tts", "language", "en")
+            selected = next(
+                (
+                    key
+                    for key, value in self._lang_map.items()
+                    if value == saved_language
+                ),
+                None,
+            )
+            self.lang_menu.setCurrentText(selected or next(iter(self._lang_map)))
+            self._populate_default_voices(saved_language)
         else:
-            self.lang_menu.configure(values=["No languages"])
-            self.voice_menu.configure(values=["No voices"])
-
+            self._set_items(self.lang_menu, ["No languages"])
+            self._set_items(self.voice_menu, ["No voices"])
         self._populate_fallback_voices()
-        self.stt_engine_menu.configure(values=STTEngine.available_engines())
-        self.stt_engine_menu.set(s.get("stt", "engine", "google"))
-        self.stt_lang_menu.set(s.get("stt", "language", "en-US"))
-        self._populate_devices()
-        self.rate_menu.set(str(s.get("recorder", "samplerate", 44100)))
-        self.folder_var.set(s.get("output", "folder", str(file_service.category_dir("tts").parent)))
 
-        ff = audio_utils.ffmpeg_available()
-        self.ffmpeg_lbl.configure(
-            text="ffmpeg: " + ("Available — MP3 export enabled." if ff else
-                               "Not found — MP3 saving is disabled (WAV works fine)."),
-            text_color=theme.SUCCESS if ff else theme.WARNING,
+        available_backends = self.app.tts.available_backends() or ["system"]
+        backend_values = [
+            self._backend_labels[key]
+            for key in available_backends
+            if key in self._backend_labels
+        ] or [self._backend_labels["system"]]
+        self._set_items(self.backend_menu, backend_values)
+        current_backend = settings.get("tts", "backend", "system")
+        self.backend_menu.setCurrentText(
+            self._backend_labels.get(current_backend, backend_values[0])
+        )
+        self._update_qwen_gpu_status()
+
+        # ``self.app.stt`` is a live instance, so the model-installed gate
+        # applies here as it does on the Speech-to-Text screen.
+        stt = self.app.stt
+        engines = stt.available_engines() or ["vosk"]
+        self._set_items(self.stt_engine_menu, engines)
+        saved_engine = settings.get("stt", "engine", "vosk")
+        self.stt_engine_menu.setCurrentText(
+            saved_engine if saved_engine in engines else engines[0]
+        )
+        saved_stt = settings.get("stt", "language", "en-US")
+        selected_stt = next(
+            (key for key, value in self._stt_lang_map.items() if value == saved_stt),
+            None,
+        )
+        self.stt_lang_menu.setCurrentText(
+            selected_stt
+            or (next(iter(self._stt_lang_map)) if self._stt_lang_map else "Unavailable")
+        )
+        self._populate_devices()
+        self.rate_menu.setCurrentText(
+            str(settings.get("recorder", "samplerate", 44100))
+        )
+        output_folder = str(
+            settings.get(
+                "output", "folder", str(file_service.category_dir("tts").parent)
+            )
+        )
+        self.folder_var.set(output_folder)
+        self.folder_entry.setText(output_folder)
+        reference = str(settings.get("tts", "qwen_reference", "") or "")
+        self.qwen_ref_var.set(reference)
+        self.qwen_ref_entry.setText(reference)
+        self.clone_switch.setChecked(bool(settings.get("clone", "enabled", True)))
+        self._set_items(
+            self.clone_engine_menu, list(self._clone_engine_labels.values())
+        )
+        saved_engine = settings.get("clone", "engine", "xtts")
+        self.clone_engine_menu.setCurrentText(
+            self._clone_engine_labels.get(saved_engine, "Coqui XTTS-v2 (default)")
+        )
+        ffmpeg = audio_utils.ffmpeg_available()
+        self.ffmpeg_lbl.setText(
+            "ffmpeg: "
+            + (
+                "Available — MP3 export enabled."
+                if ffmpeg
+                else "Not found — MP3 saving is disabled (WAV works fine)."
+            )
+        )
+        self.ffmpeg_lbl.setStyleSheet(
+            theme.label_style(theme.SUCCESS if ffmpeg else theme.WARNING, "left")
         )
 
-    def _populate_default_voices(self, lang: str) -> None:
-        voices = self.app.tts.voices(lang)
+    def _populate_default_voices(self, language: str) -> None:
+        voices = self.app.tts.voices(language)
         if not voices:
-            self.voice_menu.configure(values=["No voices"])
+            self._set_items(self.voice_menu, ["No voices"])
             return
         self._voice_map = {
-            f"{v.get('friendly', v['short_name'])[:50]} ({v['locale']})": v["short_name"]
-            for v in voices
+            (
+                f"{voice.get('friendly', voice['short_name'])[:50]} ({voice['locale']})"
+            ): voice["short_name"]
+            for voice in voices
         }
-        self.voice_menu.configure(values=list(self._voice_map))
+        self._set_items(self.voice_menu, list(self._voice_map))
         saved = self.app.settings.get("tts", "voice", "")
-        for display, short in self._voice_map.items():
-            if short == saved:
-                self.voice_menu.set(display)
-                return
-        if self._voice_map:
-            self.voice_menu.set(next(iter(self._voice_map)))
+        selected = next(
+            (label for label, short in self._voice_map.items() if short == saved),
+            next(iter(self._voice_map)),
+        )
+        self.voice_menu.setCurrentText(selected)
 
     def _populate_fallback_voices(self) -> None:
         voices = self.app.tts.voices()
         if not voices:
             return
         self._fallback_map = {
-            f"{v.get('friendly', v['short_name'])[:50]} ({v['locale']})": v["short_name"]
-            for v in voices
+            (
+                f"{voice.get('friendly', voice['short_name'])[:50]} ({voice['locale']})"
+            ): voice["short_name"]
+            for voice in voices
         }
         values = list(self._fallback_map)
-        self.fallback_voice_menu.configure(values=values)
+        self._set_items(self.fallback_voice_menu, values)
         saved = self.app.settings.get("clone", "fallback_voice", "")
-        for display, short in self._fallback_map.items():
-            if short == saved:
-                self.fallback_voice_menu.set(display)
-                return
-        if values:
-            self.fallback_voice_menu.set(values[0])
+        selected = next(
+            (label for label, short in self._fallback_map.items() if short == saved),
+            values[0],
+        )
+        self.fallback_voice_menu.setCurrentText(selected)
 
     def _populate_devices(self) -> None:
         try:
             devices = list_input_devices()
         except Exception:
             devices = []
-        self._device_map = {d["name"]: d["index"] for d in devices}
+        self._device_map = {device["name"]: device["index"] for device in devices}
         values = list(self._device_map) or ["No input devices found"]
-        self.device_menu.configure(values=values)
+        self._set_items(self.device_menu, values)
         saved = self.app.settings.get("recorder", "device")
-        def_disp = next((k for k, i in self._device_map.items() if i == saved), None)
-        if def_disp:
-            self.device_menu.set(def_disp)
-        elif values:
-            self.device_menu.set(values[0])
+        selected = next(
+            (label for label, index in self._device_map.items() if index == saved),
+            values[0],
+        )
+        self.device_menu.setCurrentText(selected)
 
-    # ------------------------------------------------------------- handlers
+    def _update_qwen_gpu_status(self) -> None:
+        if not module_installed("qwen_tts") or self.app.tts.qwen_gpu_present:
+            self.qwen_gpu_lbl.setText("")
+            return
+        self.qwen_gpu_lbl.setText(
+            "ℹ No NVIDIA GPU detected — Qwen3-TTS will run on the CPU (slow). "
+            "Install CUDA torch to use a GPU."
+        )
+
     def _on_default_lang(self, value: str) -> None:
         code = self._lang_map.get(value, "en")
         self.app.settings.set("tts", "language", code)
@@ -237,17 +435,38 @@ class SettingsScreen(Screen):
         if short:
             self.app.settings.set("tts", "voice", short)
 
+    def _on_clone_toggle(self, checked: bool | None = None) -> None:
+        enabled = self.clone_switch.isChecked()
+        self.app.settings.set("clone", "enabled", enabled)
+        if enabled:
+            self.toast(
+                "Voice cloning enabled — it needs torch and roughly 8 GB RAM.",
+                "warn",
+            )
+
+    def _on_clone_engine(self, value: str) -> None:
+        engine = self._clone_engine_map.get(value, "xtts")
+        self.app.settings.set("clone", "engine", engine)
+        self.toast("Clone engine set — pick it again inside My Voice.", "ok")
+
+    def _on_tts_backend(self, value: str) -> None:
+        backend = self._backend_map.get(value, "system")
+        self.app.settings.set("tts", "backend", backend)
+        self.app.tts.set_backend(backend)
+        self._populate_default_voices(self.app.settings.get("tts", "language", "en"))
+
     def _on_stt_engine(self, value: str) -> None:
         self.app.settings.set("stt", "engine", value)
         self.app.stt.engine = value
 
     def _on_stt_lang(self, value: str) -> None:
-        self.app.settings.set("stt", "language", value)
-        self.app.stt.language = value
+        code = self._stt_lang_map.get(value, value)
+        self.app.settings.set("stt", "language", code)
+        self.app.stt.language = code
 
     def _on_device(self, value: str) -> None:
-        idx = self._device_map.get(value)
-        self.app.settings.set("recorder", "device", idx)
+        index = self._device_map.get(value)
+        self.app.settings.set("recorder", "device", index)
         self._recreate_recorder()
 
     def _on_rate(self, value: str) -> None:
@@ -257,7 +476,7 @@ class SettingsScreen(Screen):
     def _recreate_recorder(self) -> None:
         self.app.recorder = Recorder(
             samplerate=int(self.app.settings.get("recorder", "samplerate", 44100)),
-            channels=1,
+            channels=int(self.app.settings.get("recorder", "channels", 1)),
             device=self.app.settings.get("recorder", "device"),
         )
 
@@ -266,29 +485,62 @@ class SettingsScreen(Screen):
         self.app.settings.set("clone", "fallback_voice", short or value)
 
     def _choose_folder(self) -> None:
-        from tkinter import filedialog
-
-        chosen = filedialog.askdirectory(title="Choose output folder")
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose output folder", self.folder_var.get()
+        )
         if not chosen:
             return
         resolved = Path(chosen).resolve()
         file_service.set_output_root(resolved)
         self.app.settings.set("output", "folder", str(resolved))
         self.folder_var.set(str(resolved))
+        self.folder_entry.setText(str(resolved))
         self.toast("Output folder updated.", "ok")
+
+    def _on_qwen_ref_browse(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose a voice profile (WAV)",
+            "",
+            "WAV audio (*.wav);;All files (*)",
+        )
+        if not chosen:
+            return
+        self.qwen_ref_var.set(chosen)
+        self.qwen_ref_entry.setText(chosen)
+        self.app.settings.set("tts", "qwen_reference", chosen)
+        self.toast("Qwen3-TTS reference voice updated.", "ok")
 
     def _open_data_folder(self) -> None:
         try:
-            os.startfile(str(file_service.category_dir("tts")))  # type: ignore[attr-defined]
+            path = file_service.category_dir("tts")
+            if hasattr(os, "startfile"):
+                os.startfile(str(path))
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         except Exception:
             self.toast("Could not open folder.", "error")
 
     def _reset_settings(self) -> None:
-        from tkinter import messagebox
-
-        if not messagebox.askyesno("Reset settings", "Restore all default settings?"):
+        answer = QMessageBox.question(
+            self,
+            "Reset settings",
+            "Restore all default settings?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         self.app.settings.reset()
-        file_service.set_output_root(self.app.settings.get("output", "folder", ""))
+        output = self.app.settings.get("output", "folder", "")
+        if output:
+            file_service.set_output_root(output)
         self._populate_all()
         self.toast("Settings reset.", "ok")
+
+    @staticmethod
+    def _set_items(combo: QComboBox, values: list[str]) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(values)
+        combo.blockSignals(False)

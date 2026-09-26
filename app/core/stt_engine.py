@@ -1,24 +1,28 @@
-"""Speech-to-text engine.
+"""Speech-to-text engine — fully offline (Vosk).
 
-Captures the microphone with ``sounddevice`` (no PyAudio dependency), detects
-phrase boundaries by silence, wraps the captured frames into a
-``speech_recognition.AudioData`` object and recognises them.
+Captures the microphone with ``sounddevice`` on a dedicated capture thread so
+the audio stream is *never* paused while recognition runs. Phrase segments are
+queued and recognised on a separate worker thread by the local **Vosk** engine
+(no internet, no API key). An optional ``whisper`` backend is offered when the
+package is installed.
 """
 from __future__ import annotations
 
+import queue
 import threading
-from typing import Callable, Optional
+import time
+from collections.abc import Callable
 
-from app.core.recorder import default_input_device
-
+from app.config import VOSK_MODEL_DIR
 from app.core.errors import (
     AppError,
     MicPermissionError,
     MissingDependencyError,
-    NetworkError,
-    module_available,
+    module_installed,
     soft_import,
 )
+from app.core.recorder import default_input_device
+from app.core.vosk_engine import VoskModelManager
 
 try:
     import numpy as np
@@ -32,20 +36,35 @@ except ImportError:
 
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 0.1
-SILENCE_SECONDS = 0.9
+ROLLING_SECONDS = 3.0
+SILENCE_SECONDS = 0.7
 MAX_PHRASE_SECONDS = 12.0
 MIN_PHRASE_SECONDS = 0.5
+
+# VAD thresholds in int16 RMS units (32767 = full scale)
+ABSOLUTE_FLOOR = 500.0
+FLOOR_RATIO = 2.0
+FLOOR_DELTA = 400.0
+
+_LEVEL_MAX = 32000.0
+
+
+class NoSpeechError(AppError):
+    """Raised when the recogniser heard audio but no speech."""
 
 
 class STTEngine:
     """Live microphone transcription with pluggable recognition backends."""
 
-    def __init__(self, language: str = "en-US", engine: str = "google"):
+    def __init__(self, language: str = "en-US", engine: str = "vosk"):
         self.language = language
         self.engine = engine
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._noise_floor = 0.003
+        self._thread: threading.Thread | None = None
+        self._worker: threading.Thread | None = None
+        self._queue: queue.Queue = queue.Queue()
+        self._noise_floor = ABSOLUTE_FLOOR
+        self._vosk = VoskModelManager(VOSK_MODEL_DIR, language="en")
 
     # ------------------------------------------------------------------ mic
     @property
@@ -63,34 +82,64 @@ class STTEngine:
         return True
 
     # ------------------------------------------------------------- engines
-    @staticmethod
-    def available_engines() -> list[str]:
-        engines = ["google"]
-        if module_available("whisper"):
+    def available_engines(self) -> list[str]:
+        """List recognition backends that are ready to use right now.
+
+        A backend is only offered when its Python package is installed *and* its
+        model is already on disk, so the user can never start a recording that
+        is guaranteed to fail. Vosk additionally needs a model for the selected
+        language.
+        """
+        engines: list[str] = []
+        if module_installed("vosk") and self._vosk.supported_installed(self.language):
+            engines.append("vosk")
+        if module_installed("whisper"):
             engines.append("whisper")
         return engines
 
-    def _recognize(self, audio) -> str:
-        sr = soft_import("speech_recognition")
-        if sr is None:
-            raise MissingDependencyError("speech_recognition", "SpeechRecognition")
+    def is_engine_ready(self, engine: str) -> bool:
+        """True when ``engine`` can run for the current language."""
+        return engine in self.available_engines()
 
+    def engine_status(self, engine: str) -> str:
+        """Human-readable reason why an engine is or is not available."""
+        if engine == "vosk":
+            if not module_installed("vosk"):
+                return "The 'vosk' package is not installed."
+            if not self._vosk.supported_installed(self.language):
+                return self._vosk.catalog_status(self.language)
+            return self._vosk.model_info(self.language)
+        if engine == "whisper":
+            if not module_installed("whisper"):
+                return "The 'whisper' package is not installed."
+            return "Ready"
+        return f"Unknown speech-recognition engine '{engine}'."
+
+    def _recognize_offline(self, audio, on_status=None) -> str:
+        text = self._vosk.recognize(audio, self.language)
+        return (text or "").strip()
+
+    def _recognize(self, audio, on_status=None) -> str:
         if self.engine == "whisper":
+            sr = soft_import("speech_recognition")
+            if sr is None:
+                raise MissingDependencyError("speech_recognition", "SpeechRecognition")
             try:
                 return sr.Recognizer().recognize_whisper(audio, language=self.language)
             except Exception as exc:
                 raise AppError(f"Whisper recognition failed: {exc}") from exc
 
-        # default: Google (online)
-        try:
-            return sr.Recognizer().recognize_google(audio, language=self.language)
-        except sr.RequestError as exc:
-            raise NetworkError(
-                "Speech recognition requires internet access (Google engine). "
-                f"({exc})"
-            ) from exc
-        except Exception as exc:
-            raise AppError(f"Could not recognise speech: {exc}") from exc
+        if not module_installed("vosk"):
+            raise MissingDependencyError(
+                "vosk", "vosk",
+                detail="Offline recognition needs Vosk:  pip install vosk",
+            )
+        # Raises ModelNotInstalledError when no model for this language is
+        # installed; the UI catches that and offers the Models screen.
+        text = self._recognize_offline(audio, on_status)
+        if not text:
+            raise NoSpeechError("No speech detected in that segment.")
+        return text
 
     # --------------------------------------------------------------- live
     def start_listening(
@@ -98,6 +147,7 @@ class STTEngine:
         on_text: Callable[[str], None],
         on_status: Callable[[str], None],
         on_error: Callable[[Exception], None],
+        on_level: Callable[[float], None] | None = None,
     ) -> bool:
         """Begin listening in the background. Returns False if mic busy/already running."""
         if self._thread is not None and self._thread.is_alive():
@@ -112,13 +162,21 @@ class STTEngine:
             return False
 
         self._stop_event.clear()
+        self._queue = queue.Queue()
         self._thread = threading.Thread(
-            target=self._listen_loop,
+            target=self._capture_loop,
+            args=(on_status, on_level, on_error),
+            name="stt-capture",
+            daemon=True,
+        )
+        self._worker = threading.Thread(
+            target=self._recognition_loop,
             args=(on_text, on_status, on_error),
-            name="stt-listener",
+            name="stt-recognizer",
             daemon=True,
         )
         self._thread.start()
+        self._worker.start()
         return True
 
     def stop_listening(self) -> None:
@@ -128,7 +186,11 @@ class STTEngine:
     def is_listening(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
 
-    def _listen_loop(self, on_text, on_status, on_error) -> None:
+    def model_info(self) -> str:
+        return self._vosk.model_info(self.language)
+
+    # ------------------------------------------------------------ capture
+    def _capture_loop(self, on_status, on_level, on_error) -> None:
         sd = soft_import("sounddevice")
         if sd is None:
             on_error(MissingDependencyError("sounddevice", "sounddevice"))
@@ -136,6 +198,10 @@ class STTEngine:
 
         device = default_input_device()
         blocksize = int(SAMPLE_RATE * BLOCK_SECONDS)
+        silence_blocks = int(SILENCE_SECONDS / BLOCK_SECONDS)
+        max_blocks = int(MAX_PHRASE_SECONDS / BLOCK_SECONDS)
+        rolling_blocks = int(ROLLING_SECONDS / BLOCK_SECONDS)
+        min_blocks = int(MIN_PHRASE_SECONDS / BLOCK_SECONDS)
         try:
             on_status("Calibrating for ambient noise…")
             with sd.InputStream(
@@ -145,51 +211,96 @@ class STTEngine:
                 device=device,
                 blocksize=blocksize,
             ) as stream:
-                # ambient calibration
                 samples = []
                 for _ in range(int(1.0 / BLOCK_SECONDS)):
                     block, _ = stream.read(blocksize)
                     samples.append(block)
                 calib = np.concatenate(samples)
-                self._noise_floor = float(np.sqrt((calib.astype(np.float32) ** 2).mean())) + 0.002
+                self._noise_floor = max(
+                    float(np.sqrt((calib.astype(np.float32) ** 2).mean())),
+                    ABSOLUTE_FLOOR,
+                )
 
-                buffer = bytearray()
+                phrase: list[np.ndarray] = []
+                phrase_blocks = 0
                 silent_blocks = 0
-                max_blocks = int(MAX_PHRASE_SECONDS / BLOCK_SECONDS)
-                min_blocks = int(MIN_PHRASE_SECONDS / BLOCK_SECONDS)
-                silence_blocks = int(SILENCE_SECONDS / BLOCK_SECONDS)
+                speech_seen = False
 
                 on_status("Listening…")
                 while not self._stop_event.is_set():
                     block, _ = stream.read(blocksize)
                     frame = block.astype(np.float32)
                     rms = float(np.sqrt((frame ** 2).mean()))
-                    is_silent = rms < self._noise_floor
+                    if on_level:
+                        on_level(min(rms / _LEVEL_MAX, 1.0))
 
-                    if not is_silent:
-                        buffer.extend(block.tobytes())
+                    is_speech = (
+                        rms >= ABSOLUTE_FLOOR
+                        and rms >= max(self._noise_floor * FLOOR_RATIO,
+                                       self._noise_floor + FLOOR_DELTA)
+                    )
+
+                    if is_speech:
+                        phrase.append(block)
+                        phrase_blocks += 1
                         silent_blocks = 0
+                        speech_seen = True
                     else:
                         silent_blocks += 1
+                        if not phrase:
+                            self._noise_floor = round(
+                                self._noise_floor * 0.9 + rms * 0.1, 3
+                            )
 
-                    buffer_len_blocks = len(buffer) / (2 * SAMPLE_RATE * BLOCK_SECONDS)
-                    if buffer and (buffer_len_blocks >= max_blocks or (
-                            silent_blocks >= silence_blocks and buffer_len_blocks >= min_blocks)):
-                        on_status("Recognising…")
-                        try:
-                            from speech_recognition import AudioData as SRAudioData
+                    if speech_seen and (
+                        phrase_blocks >= max_blocks
+                        or (
+                            silent_blocks >= silence_blocks
+                            and phrase_blocks >= min_blocks
+                        )
+                        or (silent_blocks == 0 and phrase_blocks >= rolling_blocks)
+                    ):
+                        self._ship(phrase)
+                        phrase = []
+                        phrase_blocks = 0
+                        speech_seen = False
 
-                            audio = SRAudioData(bytes(buffer), SAMPLE_RATE, 2)
-                            text = (self._recognize(audio) or "").strip()
-                            buffer = bytearray()
-                            silent_blocks = 0
-                            if text:
-                                on_text(text)
-                                on_status("Listening…")
-                        except Exception as exc:
-                            buffer = bytearray()
-                            silent_blocks = 0
-                            on_status("Listening…")
-                            on_error(exc)
-        except Exception as exc:
+                if speech_seen and phrase_blocks >= min_blocks:
+                    self._ship(phrase)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
             on_error(exc)
+
+    def _ship(self, phrase: list[np.ndarray]) -> None:
+        try:
+            from speech_recognition import AudioData as SRAudioData
+        except ImportError:
+            return
+        data = np.concatenate(phrase).tobytes()
+        self._queue.put(SRAudioData(data, SAMPLE_RATE, 2))
+
+    # -------------------------------------------------------- recognition
+    def _recognition_loop(self, on_text, on_status, on_error) -> None:
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                audio = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if audio is None:
+                continue
+            try:
+                on_status("Recognising…")
+                start = time.perf_counter()
+                text = (self._recognize(audio, on_status) or "").strip()
+                elapsed = time.perf_counter() - start
+            except NoSpeechError:
+                on_status("Listening…")
+                continue
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+                on_error(exc)
+                on_status("Listening…")
+                continue
+            if text:
+                on_text(text)
+                on_status(f"Listening… (response {elapsed:.1f}s)")
+            else:
+                on_status("Listening…")

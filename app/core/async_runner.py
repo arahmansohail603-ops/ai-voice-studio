@@ -1,23 +1,23 @@
 """A dedicated asyncio event loop running in a background thread.
 
-The GUI runs on the main thread (tkinter/customtkinter) and must never block.
-Latency-free async libraries such as ``edge-tts`` are driven on this loop so
-screens can ``await`` their results without freezing the interface.
+The GUI runs on the main thread (PyQt5) and must never block.
+Async work is driven on this loop so screens can ``await`` their results
+without freezing the interface.
 """
 from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Awaitable
 from concurrent.futures import Future
-from typing import Awaitable, Optional
 
 
 class AsyncRunner:
     """Owns one asyncio event loop in a daemon thread."""
 
     def __init__(self) -> None:
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     @property

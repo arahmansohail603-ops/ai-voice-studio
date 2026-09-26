@@ -1,0 +1,21 @@
+# AI Voice Studio — optional fully-offline engines.
+#
+# Free and open-source. Runs entirely on your machine: no cloud, no API keys,
+# no accounts. Install only what you need:
+#
+#   pip install -r requirements-local.txt
+
+# Offline speech-to-text (Apache-2.0). Models download once per language
+# (~50 MB) and then work with no internet.
+vosk>=0.3.45
+
+# Offline translation (MIT). Language pairs install once (free), then offline.
+argostranslate>=1.9.6
+
+# Broad offline speech-to-text (MIT) — ~99 languages incl. Urdu/Hindi.
+# Needs torch and ffmpeg; models download once, then run offline on CPU.
+openai-whisper>=20240930
+
+# Optional offline neural text-to-speech (MIT). Add a *.onnx voice model to
+# %USERPROFILE%\AI Voice Studio Data\models\piper-voices\ to use it. System voices (pyttsx3) need nothing extra.
+# piper-tts>=1.2.0

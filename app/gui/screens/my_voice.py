@@ -1,259 +1,470 @@
-"""My Voice screen: authorized voice sample -> cloned or fallback speech.
-
-Voice cloning is clearly labelled: outputs marked 'Voice Clone' only when the
-local XTTS model actually synthesised them; otherwise a 'Fallback Voice'
-notice explains a neural voice was used. Consent is required before any
-generation, and the reference recording must be something the user owns or has
-permission to use.
-"""
 from __future__ import annotations
 
 from pathlib import Path
 
-import customtkinter as ctk
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config import language_display_name
 from app.core import audio_utils
+from app.core.piper_voices import PiperVoiceLibrary
+from app.core.qwen_cloner import QwenVoiceCloner
 from app.core.voice_cloner import CloneState, VoiceCloner
 from app.gui import theme
-from app.gui.widgets import AudioPlayerBar, BusyButton, MethodBadge, Screen
+from app.gui.widgets import AudioPlayerBar, BusyButton, MethodBadge, Screen, TextEdit
 from app.services import file_service
+
+_ENGINE_LABELS = {
+    "xtts": "Coqui XTTS-v2",
+    "qwen": "Qwen3-TTS 1.7B Base",
+}
+_ENGINE_KEYS = {value: key for key, value in _ENGINE_LABELS.items()}
+_ALL_CLONE_LANGS = sorted(
+    set(VoiceCloner.supported_languages()) | set(QwenVoiceCloner.supported_languages())
+)
+
+
+class _ConsentValue:
+    def __init__(self, checkbox: QCheckBox):
+        self.checkbox = checkbox
+
+    def get(self) -> bool:
+        return self.checkbox.isChecked()
+
+    def set(self, value) -> None:
+        self.checkbox.setChecked(bool(value))
 
 
 class MyVoiceScreen(Screen):
     def __init__(self, master, app):
         super().__init__(master, app)
-        self.grid_columnconfigure(0, weight=1)
-
         self.ref_path: Path | None = None
         self.ref_duration = 0.0
         self.profile_path: Path | None = None
         self._last_result = None
         self._ref_tracking = False
-        self._ref_track_job = None
+        self._ref_track_timer = QTimer(self)
+        self._ref_track_timer.setInterval(100)
+        self._ref_track_timer.timeout.connect(self._ref_tick)
         self._generating = False
         self._fallback_populated = False
-        self._fallback_map: dict = {}
-        self._consent_var = ctk.BooleanVar(value=False)
+        self._fallback_map: dict[str, str] = {}
+        self._gen_lang = "en"
 
-        # ----------------------------------------------------------- top notice
-        notice = ctk.CTkFrame(self, fg_color=theme.ACCENT_SOFT, corner_radius=12)
-        notice.grid(row=0, column=0, sticky="ew")
-        ctk.CTkLabel(
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(theme.scroll_style(theme.APP_BG))
+        content = QWidget()
+        content.setStyleSheet("QWidget { background: transparent; }")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(14)
+        scroll.setWidget(content)
+        root.addWidget(scroll)
+
+        notice = QFrame(content)
+        notice.setStyleSheet(theme.frame_style(theme.ACCENT_SOFT, 12))
+        notice_layout = QVBoxLayout(notice)
+        notice_layout.setContentsMargins(16, 12, 16, 12)
+        notice_title = QLabel("Voice Cloning Notice", notice)
+        notice_title.setFont(theme.font(14, "bold"))
+        notice_title.setStyleSheet(theme.label_style(theme.ACCENT, "left"))
+        notice_layout.addWidget(notice_title)
+        notice_text = QLabel(
+            "Cloning synthesises speech that resembles a recorded reference voice. "
+            "Only use a recording you own or have explicit permission to use. "
+            "Generated Voice Clone audio is clearly labelled in this app.",
             notice,
-            text="Voice Cloning Notice",
-            font=theme.font(14, "bold"), text_color=theme.ACCENT, anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 2))
-        ctk.CTkLabel(
-            notice,
-            text="Cloning synthesises speech that resembles a recorded reference voice. "
-                 "Only use a recording you own or have explicit permission to use. "
-                 "Generated 'Voice Clone' audio is clearly labelled in this app.",
-            font=theme.font(12), text_color=theme.TEXT, wraplength=900, justify="left", anchor="w",
-        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        )
+        notice_text.setFont(theme.font(12))
+        notice_text.setWordWrap(True)
+        notice_text.setStyleSheet(theme.label_style(theme.TEXT, "left"))
+        notice_layout.addWidget(notice_text)
+        engine_row = QFrame(notice)
+        engine_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        engine_layout = QHBoxLayout(engine_row)
+        engine_layout.setContentsMargins(0, 0, 0, 0)
+        engine_label = QLabel("Clone engine:", engine_row)
+        engine_label.setFont(theme.font(12, "bold"))
+        engine_label.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        engine_layout.addWidget(engine_label)
+        self.engine_menu = self._combo(engine_row, list(_ENGINE_LABELS.values()), 200)
+        self.engine_menu.currentTextChanged.connect(self._on_engine)
+        engine_layout.addWidget(self.engine_menu)
+        engine_layout.addStretch(1)
+        notice_layout.addWidget(engine_row)
+        content_layout.addWidget(notice)
 
-        # ------------------------------------------------------- source panel
-        source = ctk.CTkFrame(self, fg_color=theme.PANEL_BG, corner_radius=12)
-        source.grid(row=1, column=0, sticky="ew", pady=(14, 0))
-        source.grid_columnconfigure(5, weight=1)
-
-        ctk.CTkLabel(source, text="1 · Provide an authorised voice sample",
-                     font=theme.font(14, "bold"), text_color=theme.TEXT, anchor="w",
-                     ).grid(row=0, column=0, columnspan=6, sticky="w", padx=16, pady=(12, 2))
-        ctk.CTkLabel(source, text="Record 3–40s of clear speech, or upload an existing recording.",
-                     font=theme.font(12), text_color=theme.SUBTEXT, anchor="w",
-                     ).grid(row=1, column=0, columnspan=6, sticky="w", padx=16, pady=(0, 10))
-
+        source = self._panel(content, "1 · Provide an authorised voice sample")
+        source_text = QLabel(
+            "Record 3–40s of clear speech, or upload an existing recording.", source
+        )
+        source_text.setFont(theme.font(12))
+        source_text.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        source_layout = source.layout()
+        source_layout.addWidget(source_text)
+        source_buttons = QFrame(source)
+        source_buttons.setStyleSheet(
+            "QFrame { background: transparent; border: none; }"
+        )
+        source_button_layout = QHBoxLayout(source_buttons)
+        source_button_layout.setContentsMargins(0, 0, 0, 0)
         self.ref_record_btn = BusyButton(
-            source, text="Record Sample", command=self._toggle_ref_record,
-            width=130, height=34, font=theme.font(13, "bold"),
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            source_buttons,
+            text="Record Sample",
+            command=self._toggle_ref_record,
+            width=130,
+            height=34,
+            font=theme.font(13, "bold"),
+            fg_color=theme.ACCENT,
+            hover_color=theme.ACCENT_HOVER,
+            text_color=theme.ON_ACCENT,
         )
-        self.ref_record_btn.grid(row=2, column=0, padx=(16, 6), pady=(0, 10))
-        self.ref_stop_btn = ctk.CTkButton(
-            source, text="Stop", command=self._stop_ref_record, width=70, height=34,
-            state="disabled", font=theme.font(13), fg_color=theme.DANGER, hover_color="#c94343",
+        source_button_layout.addWidget(self.ref_record_btn)
+        self.ref_stop_btn = QPushButton("Stop", source_buttons)
+        self._style_button(self.ref_stop_btn, 70, 34, theme.DANGER)
+        self.ref_stop_btn.clicked.connect(self._stop_ref_record)
+        self.ref_stop_btn.setEnabled(False)
+        source_button_layout.addWidget(self.ref_stop_btn)
+        self.ref_timer = QLabel("00:00.0", source_buttons)
+        self.ref_timer.setFont(theme.font(14, "bold"))
+        self.ref_timer.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        source_button_layout.addWidget(self.ref_timer)
+        self.upload_btn = QPushButton("Upload Sample…", source_buttons)
+        self._style_button(self.upload_btn, 130, 34)
+        self.upload_btn.clicked.connect(self._upload_sample)
+        source_button_layout.addWidget(self.upload_btn)
+        source_button_layout.addStretch(1)
+        source_layout.addWidget(source_buttons)
+        self.consent_lbl = QLabel("", source)
+        self.consent_lbl.setFont(theme.font(12))
+        self.consent_lbl.setWordWrap(True)
+        self.consent_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        source_layout.addWidget(self.consent_lbl)
+        content_layout.addWidget(source)
+
+        sample = self._panel(content, "2 · Reference sample & profile")
+        sample_layout = sample.layout()
+        self.ref_lbl = QLabel("No voice sample loaded yet.", sample)
+        self.ref_lbl.setFont(theme.font(12))
+        self.ref_lbl.setWordWrap(True)
+        self.ref_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+        sample_layout.addWidget(self.ref_lbl)
+        transcript_label = QLabel(
+            "Reference transcript (optional — spoken words in the sample):", sample
         )
-        self.ref_stop_btn.grid(row=2, column=1, padx=6, pady=(0, 10))
-        self.ref_timer = ctk.CTkLabel(source, text="00:00.0", font=theme.font(14, "bold"),
-                                      text_color=theme.SUBTEXT)
-        self.ref_timer.grid(row=2, column=2, padx=10, pady=(0, 10))
-
-        self.upload_btn = ctk.CTkButton(
-            source, text="Upload Sample…", command=self._upload_sample,
-            width=130, height=34, font=theme.font(13),
-            fg_color=theme.INPUT_BG, border_width=1, border_color=theme.BORDER,
+        transcript_label.setFont(theme.font(11))
+        transcript_label.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        sample_layout.addWidget(transcript_label)
+        self.transcript_entry = QLineEdit(sample)
+        self.transcript_entry.setStyleSheet(theme.input_style())
+        sample_layout.addWidget(self.transcript_entry)
+        transcript_note = QLabel(
+            "Improves Qwen3-TTS clone quality; Coqui XTTS-v2 ignores it.", sample
         )
-        self.upload_btn.grid(row=2, column=3, padx=(14, 6), pady=(0, 10))
-
-        # ------------------------------------------------------ consent (SP)
-        self.consent_lbl = ctk.CTkLabel(
-            source, text="", font=theme.font(12), text_color=theme.SUBTEXT, anchor="w",
+        transcript_note.setFont(theme.font(11))
+        transcript_note.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        sample_layout.addWidget(transcript_note)
+        self.consent = QCheckBox(
+            "I confirm I own or have permission to use this voice recording.", sample
         )
-        self.consent_lbl.grid(row=3, column=0, columnspan=6, sticky="w", padx=16, pady=(0, 10))
-
-        # ------------------------------------------------------------- sample
-        sample = ctk.CTkFrame(self, fg_color=theme.PANEL_BG, corner_radius=12)
-        sample.grid(row=2, column=0, sticky="ew", pady=(14, 0))
-        sample.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(sample, text="2 · Reference sample & profile",
-                     font=theme.font(14, "bold"), text_color=theme.TEXT, anchor="w",
-                     ).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(12, 2))
-        self.ref_lbl = ctk.CTkLabel(
-            sample, text="No voice sample loaded yet.", font=theme.font(12),
-            text_color=theme.WARNING, anchor="w",
-        )
-        self.ref_lbl.grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 4))
-
-        self.consent = ctk.CTkCheckBox(
-            sample,
-            text="I confirm I own or have permission to use this voice recording.",
-            variable=self._consent_var, command=self._on_consent,
-            font=theme.font(12), fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-        )
-        self.consent.grid(row=2, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 6))
-
+        self.consent.setFont(theme.font(12))
+        self.consent.setStyleSheet(theme.check_style())
+        self.consent.toggled.connect(self._on_consent)
+        self._consent_var = _ConsentValue(self.consent)
+        sample_layout.addWidget(self.consent)
+        profile_row = QFrame(sample)
+        profile_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        profile_layout = QHBoxLayout(profile_row)
+        profile_layout.setContentsMargins(0, 0, 0, 0)
         self.create_profile_btn = BusyButton(
-            sample, text="Create Voice Profile", command=self._create_profile,
-            height=36, font=theme.font(13, "bold"),
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            profile_row,
+            text="Create Voice Profile",
+            command=self._create_profile,
+            height=36,
+            font=theme.font(13, "bold"),
+            fg_color=theme.ACCENT,
+            hover_color=theme.ACCENT_HOVER,
+            text_color=theme.ON_ACCENT,
         )
-        self.create_profile_btn.grid(row=3, column=0, sticky="w", padx=16, pady=(2, 6))
-
-        self.clone_state_badge = MethodBadge(sample, "clone")
-        self.clone_state_badge.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 6))
-
-        self.clone_status_lbl = ctk.CTkLabel(
-            sample, text="Model not loaded. 'Create Voice Profile' loads it on first use (~2 GB).",
-            font=theme.font(12), text_color=theme.SUBTEXT, anchor="w",
+        profile_layout.addWidget(self.create_profile_btn)
+        self.clone_state_badge = MethodBadge(profile_row, "clone")
+        profile_layout.addWidget(self.clone_state_badge)
+        profile_layout.addStretch(1)
+        sample_layout.addWidget(profile_row)
+        self.clone_status_lbl = QLabel(
+            "Model not loaded. Create Voice Profile loads it on first use (~2 GB).",
+            sample,
         )
-        self.clone_status_lbl.grid(row=4, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
+        self.clone_status_lbl.setFont(theme.font(12))
+        self.clone_status_lbl.setWordWrap(True)
+        self.clone_status_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        sample_layout.addWidget(self.clone_status_lbl)
+        content_layout.addWidget(sample)
 
-        # ------------------------------------------------------- generation
-        gen_panel = ctk.CTkFrame(self, fg_color=theme.PANEL_BG, corner_radius=12)
-        gen_panel.grid(row=3, column=0, sticky="ew", pady=(14, 0))
-        gen_panel.grid_columnconfigure(2, weight=1)
-
-        ctk.CTkLabel(gen_panel, text="3 · Generate speech with your voice",
-                     font=theme.font(14, "bold"), text_color=theme.TEXT, anchor="w",
-                     ).grid(row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(12, 4))
-
-        self.gen_text = ctk.CTkTextbox(
-            gen_panel, height=110, wrap="word", corner_radius=10,
-            fg_color=theme.INPUT_BG, text_color=theme.TEXT,
-            border_width=1, border_color=theme.BORDER, font=theme.font(13),
+        gen_panel = self._panel(content, "3 · Generate speech with your voice")
+        gen_layout = gen_panel.layout()
+        self.gen_text = TextEdit(gen_panel)
+        self.gen_text.setFixedHeight(110)
+        self.gen_text.setAcceptRichText(False)
+        self.gen_text.setStyleSheet(theme.input_style())
+        self.gen_text.setPlainText(
+            "Speak the way I speak. This sentence is cloned from my voice."
         )
-        self.gen_text.grid(row=1, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 10))
-        self.gen_text.insert("1.0", "Speak the way I speak. This sentence is cloned from my voice.")
-
-        ctk.CTkLabel(gen_panel, text="Language:", font=theme.font(13),
-                     text_color=theme.SUBTEXT).grid(row=2, column=0, sticky="e", padx=(16, 4))
-        self.clone_lang_menu = ctk.CTkOptionMenu(
-            gen_panel, values=[f"{language_display_name(l)} ({l})" for l in VoiceCloner.supported_languages()],
-            width=180, dynamic_resizing=False, font=theme.font(12),
-            fg_color=theme.INPUT_BG, button_color=theme.ACCENT,
+        gen_layout.addWidget(self.gen_text)
+        language_row = QFrame(gen_panel)
+        language_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        language_layout = QHBoxLayout(language_row)
+        language_layout.setContentsMargins(0, 0, 0, 0)
+        language_label = QLabel("Language:", language_row)
+        language_label.setFont(theme.font(13))
+        language_label.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        language_layout.addWidget(language_label)
+        self.clone_lang_menu = self._combo(
+            language_row,
+            [f"{language_display_name(code)} ({code})" for code in _ALL_CLONE_LANGS],
+            180,
         )
-        self.clone_lang_menu.set("English (en)")
-        self.clone_lang_menu.grid(row=2, column=1, sticky="w", padx=4, pady=(0, 10))
-
-        ctk.CTkLabel(gen_panel, text="Fallback voice:", font=theme.font(13),
-                     text_color=theme.SUBTEXT).grid(row=2, column=2, sticky="e", padx=(12, 4))
-        self.fallback_voice_menu = ctk.CTkOptionMenu(
-            gen_panel, values=["Default"], width=240, dynamic_resizing=False,
-            font=theme.font(12), fg_color=theme.INPUT_BG, button_color=theme.ACCENT,
-        )
-        self.fallback_voice_menu.grid(row=2, column=3, sticky="w", padx=4, pady=(0, 10))
-
+        self.clone_lang_menu.setCurrentText("English (en)")
+        language_layout.addWidget(self.clone_lang_menu)
+        fallback_label = QLabel("Fallback voice:", language_row)
+        fallback_label.setFont(theme.font(13))
+        fallback_label.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        language_layout.addWidget(fallback_label)
+        self.fallback_voice_menu = self._combo(language_row, ["Default"], 240)
+        language_layout.addWidget(self.fallback_voice_menu)
+        language_layout.addStretch(1)
+        gen_layout.addWidget(language_row)
+        action_row = QFrame(gen_panel)
+        action_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
         self.generate_btn = BusyButton(
-            gen_panel, text="Generate Speech", command=self._generate,
-            height=38, font=theme.font(14, "bold"),
-            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            action_row,
+            text="Generate Speech",
+            command=self._generate,
+            height=38,
+            font=theme.font(14, "bold"),
+            fg_color=theme.ACCENT,
+            hover_color=theme.ACCENT_HOVER,
+            text_color=theme.ON_ACCENT,
         )
-        self.generate_btn.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 14))
-        self.result_badge = MethodBadge(gen_panel, "clone")
-        self.result_badge.grid(row=3, column=1, sticky="w", padx=4, pady=(0, 14))
-        self.gen_status_lbl = ctk.CTkLabel(
-            gen_panel, text="", font=theme.font(12), text_color=theme.SUBTEXT, anchor="w",
+        action_layout.addWidget(self.generate_btn)
+        self.result_badge = MethodBadge(action_row, "clone")
+        action_layout.addWidget(self.result_badge)
+        self.gen_status_lbl = QLabel("", action_row)
+        self.gen_status_lbl.setFont(theme.font(12))
+        self.gen_status_lbl.setWordWrap(True)
+        self.gen_status_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        action_layout.addWidget(self.gen_status_lbl, 1)
+        # Shown when the requested language has no installed voice, which
+        # silently produced English audio from non-English text before.
+        self.get_voice_btn = QPushButton("Get a voice", action_row)
+        self.get_voice_btn.setFont(theme.font(12))
+        self.get_voice_btn.setStyleSheet(
+            theme.button_style(
+                theme.ACCENT, theme.ACCENT_HOVER, theme.ON_ACCENT, 8, theme.ACCENT, 1
+            )
         )
-        self.gen_status_lbl.grid(row=3, column=2, columnspan=2, sticky="ew", padx=12, pady=(0, 14))
+        self.get_voice_btn.clicked.connect(self._on_get_voice)
+        self.get_voice_btn.setVisible(False)
+        action_layout.addWidget(self.get_voice_btn)
+        gen_layout.addWidget(action_row)
+        content_layout.addWidget(gen_panel)
 
-        # ------------------------------------------------------ preview/save
-        preview = ctk.CTkFrame(self, fg_color=theme.PANEL_BG, corner_radius=12)
-        preview.grid(row=4, column=0, sticky="ew", pady=(14, 0))
-        preview.grid_columnconfigure(0, weight=1)
-
+        preview = self._panel(content, "Preview & save")
+        preview_layout = preview.layout()
         if app.player is not None:
             self.player_bar = AudioPlayerBar(preview, app.player)
-            self.player_bar.grid(row=0, column=0, sticky="ew", padx=14, pady=10)
+            preview_layout.addWidget(self.player_bar)
         else:
             self.player_bar = None
-
-        save_row = ctk.CTkFrame(preview, fg_color="transparent")
-        save_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+            unavailable = QLabel(
+                "Playback unavailable (no audio output device). "
+                "Audio files are still saved on disk.",
+                preview,
+            )
+            unavailable.setFont(theme.font(13))
+            unavailable.setWordWrap(True)
+            unavailable.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+            preview_layout.addWidget(unavailable)
+        save_row = QFrame(preview)
+        save_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        save_layout = QHBoxLayout(save_row)
+        save_layout.setContentsMargins(0, 0, 0, 0)
         self.save_btn = BusyButton(
-            save_row, text="Save Audio", command=self._save_result,
-            width=130, height=34, font=theme.font(13, "bold"),
-            fg_color=theme.INPUT_BG, border_width=1, border_color=theme.BORDER,
+            save_row,
+            text="Save Audio",
+            command=self._save_result,
+            width=130,
+            height=34,
+            font=theme.font(13, "bold"),
+            fg_color=theme.INPUT_BG,
+            hover_color=theme.CARD_BG,
+            border_color=theme.BORDER,
+            border_width=1,
         )
-        self.save_btn.pack(side="left")
+        save_layout.addWidget(self.save_btn)
+        save_layout.addStretch(1)
+        preview_layout.addWidget(save_row)
+        content_layout.addWidget(preview)
+        content_layout.addStretch(1)
 
-    # ------------------------------------------------------------ lifecycle
+    @staticmethod
+    def _panel(parent: QWidget, title: str) -> QFrame:
+        panel = QFrame(parent)
+        panel.setStyleSheet(theme.frame_style(theme.PANEL_BG, 12))
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(6)
+        title_label = QLabel(title, panel)
+        title_label.setFont(theme.font(14, "bold"))
+        title_label.setStyleSheet(theme.label_style(theme.TEXT, "left"))
+        layout.addWidget(title_label)
+        return panel
+
+    @staticmethod
+    def _combo(parent: QWidget, values: list[str], width: int) -> QComboBox:
+        combo = QComboBox(parent)
+        combo.addItems(values)
+        combo.setFixedWidth(width)
+        combo.setFont(theme.font(12))
+        combo.setStyleSheet(theme.combo_style())
+        return combo
+
+    @staticmethod
+    def _style_button(
+        button: QPushButton, width: int, height: int, color: str = theme.TEXT
+    ) -> None:
+        button.setFixedSize(width, height)
+        button.setFont(theme.font(13))
+        button.setStyleSheet(
+            theme.button_style(theme.INPUT_BG, theme.CARD_BG, color, 8, theme.BORDER, 1)
+        )
+
     def on_show(self, **kwargs) -> None:
         self._consent_var.set(bool(self.app.settings.get("clone", "consent", False)))
+        saved_engine = self.app.settings.get("clone", "engine", "xtts")
+        self.engine_menu.setCurrentText(
+            _ENGINE_LABELS.get(saved_engine, "Coqui XTTS-v2")
+        )
         self._populate_fallback_voices()
         self._refresh_clone_state()
-
+        self._populate_clone_languages()
         if self.app.tts.voices_loaded and not self._fallback_populated:
             self._fallback_populated = True
             self._populate_fallback_voices()
+        saved_profile = self.app.settings.get("clone", "profile", "")
+        if self.profile_path is None and saved_profile and Path(saved_profile).exists():
+            self.profile_path = Path(saved_profile)
 
     def on_hide(self) -> None:
         self._ref_tracking = False
-        if self._ref_track_job:
-            self.after_cancel(self._ref_track_job)
-            self._ref_track_job = None
+        self._ref_track_timer.stop()
         if self.app.recorder.is_recording:
             self.app.recorder.stop()
 
-    # ------------------------------------------------------------ fallback voices
     def _populate_fallback_voices(self) -> None:
         voices = self.app.tts.voices()
         if not voices:
             return
+        self._fallback_populated = True
         self._fallback_map = {
-            v["friendly"][:60] + "  ·  " + v["locale"]: v["short_name"] for v in voices
+            voice.get("friendly", voice["short_name"])[:60]
+            + "  ·  "
+            + voice["locale"]: voice["short_name"]
+            for voice in voices
         }
         values = list(self._fallback_map)
-        self.fallback_voice_menu.configure(values=values)
+        self._set_items(self.fallback_voice_menu, values)
         saved = self.app.settings.get("clone", "fallback_voice", "")
-        if values:
-            for display, short in self._fallback_map.items():
-                if short == saved:
-                    self.fallback_voice_menu.set(display)
-                    break
-            else:
-                self.fallback_voice_menu.set(values[0])
+        # A saved voice whose engine is gone (Piper uninstalled, model deleted)
+        # must not stay selected -- generating would fail every time.
+        if saved and not self.app.tts.voice_usable(saved):
+            saved = self._resolve_usable_voice("")
+            if saved:
+                self.app.settings.set("clone", "fallback_voice", saved)
+        selected = next(
+            (label for label, short in self._fallback_map.items() if short == saved),
+            values[0],
+        )
+        self.fallback_voice_menu.setCurrentText(selected)
 
-    def _fallback_voice(self) -> str:
-        display = self.fallback_voice_menu.get()
-        if self._fallback_map and display in self._fallback_map:
-            return self._fallback_map[display]
-        return self.app.settings.get("clone", "fallback_voice", "en-US-ChristopherNeural")
+    def _resolve_usable_voice(self, lang_code: str) -> str:
+        """A fallback voice this machine can really speak, or ""."""
+        tts = self.app.tts
+        pool = tts.voices(lang_code) if lang_code else []
+        for voice in pool or tts.voices():
+            if voice.get("gender", "").lower() in ("female", "feminine") and tts.voice_usable(
+                voice["short_name"]
+            ):
+                return voice["short_name"]
+        for voice in pool or tts.voices():
+            if tts.voice_usable(voice["short_name"]):
+                return voice["short_name"]
+        return tts._system_fallback_voice(lang_code) or ""
 
-    # ---------------------------------------------------------- record sample
+    def _fallback_voice(self, lang_code: str = "") -> str:
+        tts = self.app.tts
+        saved = self.app.settings.get("clone", "fallback_voice", "")
+        if saved and tts.voice_usable(saved):
+            return saved
+        resolved = self._resolve_usable_voice(lang_code)
+        if resolved:
+            return resolved
+        display = self.fallback_voice_menu.currentText()
+        return self._fallback_map.get(display, saved)
+
+    def _populate_clone_languages(self) -> None:
+        languages = sorted(self.app.active_cloner.supported_languages())
+        values = [f"{language_display_name(code)} ({code})" for code in languages]
+        self._set_items(self.clone_lang_menu, values)
+        if values and self.clone_lang_menu.currentText() not in values:
+            self.clone_lang_menu.setCurrentText(values[0])
+
+    def _on_engine(self, label: str) -> None:
+        engine = _ENGINE_KEYS.get(label, "xtts")
+        self.app.settings.set("clone", "engine", engine)
+        self._populate_clone_languages()
+        self._refresh_clone_state()
+        if engine == "qwen" and not self.app.qwen_cloner._cuda_available():
+            self.toast(
+                "Qwen3-TTS: no NVIDIA GPU — will run on CPU (slow).",
+                "info",
+            )
+        else:
+            self.toast(f"Clone engine: {label}", "info")
+
     def _toggle_ref_record(self) -> None:
-        rec = self.app.recorder
-        if rec.is_recording:
+        recorder = self.app.recorder
+        if recorder.is_recording:
             self._stop_ref_record()
             return
         try:
-            rec.start()
+            recorder.start()
             self.ref_record_btn.set_busy(True, "Recording…")
-            self.ref_stop_btn.configure(state="normal")
-            self.ref_timer.configure(text_color=theme.SUCCESS)
-            self.consent_lbl.configure(text="Recording reference sample… speak clearly.", text_color=theme.WARNING)
+            self.ref_stop_btn.setEnabled(True)
+            self.ref_timer.setStyleSheet(theme.label_style(theme.SUCCESS))
+            self.consent_lbl.setText("Recording reference sample… speak clearly.")
+            self.consent_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
             self._ref_tracking = True
+            self._ref_track_timer.start()
             self._ref_tick()
         except Exception as exc:
             self.toast(str(exc), "error")
@@ -261,55 +472,57 @@ class MyVoiceScreen(Screen):
     def _ref_tick(self) -> None:
         if not self._ref_tracking:
             return
-        secs = int(self.app.recorder.elapsed() * 10)
-        self.ref_timer.configure(text=f"{secs // 600:02d}:{(secs // 10) % 60:02d}.{secs % 10}")
-        self._ref_track_job = self.after(100, self._ref_tick)
+        tenths = int(self.app.recorder.elapsed() * 10)
+        self.ref_timer.setText(
+            f"{tenths // 600:02d}:{(tenths // 10) % 60:02d}.{tenths % 10}"
+        )
 
     def _stop_ref_record(self) -> None:
-        rec = self.app.recorder
-        if not rec.is_recording and rec.capture is None:
+        recorder = self.app.recorder
+        if not recorder.is_recording and recorder.capture is None:
             return
         self._ref_tracking = False
-        rec.stop()
+        self._ref_track_timer.stop()
+        recorder.stop()
         self.ref_record_btn.set_busy(False)
-        self.ref_stop_btn.configure(state="disabled")
-
-        if rec.capture is None or rec.capture.size == 0:
+        self.ref_stop_btn.setEnabled(False)
+        if recorder.capture is None or recorder.capture.size == 0:
             self.toast("No audio captured.", "warn")
             return
         path = file_service.unique_path(
             file_service.category_dir("voices"),
-            file_service.timestamp_stem("sample_draft"), "wav",
+            file_service.timestamp_stem("sample_draft"),
+            "wav",
         )
         try:
-            rec.save(path, "wav")
+            recorder.save(path, "wav")
             self._accept_reference(path)
         except Exception as exc:
             self.toast(str(exc), "error")
 
     def _upload_sample(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.askopenfilename(
-            title="Select an authorised voice sample",
-            filetypes=[("Audio", "*.wav *.mp3 *.ogg *.flac"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select an authorised voice sample",
+            "",
+            "Audio (*.wav *.mp3 *.ogg *.flac);;All files (*)",
         )
-        if not path:
-            return
-        self._accept_reference(Path(path))
+        if path:
+            self._accept_reference(Path(path))
 
     def _accept_reference(self, path: Path) -> None:
         try:
-            self.app.cloner.validate_sample(path)
+            self.app.active_cloner.validate_sample(path)
         except Exception as exc:
             self.toast(str(exc), "error")
             return
         self.ref_path = path
         self.ref_duration = audio_utils.audio_duration(path)
-        self.ref_lbl.configure(
-            text=f"Sample: {path.name}  ·  {self.ref_duration:.1f}s  (authorised use confirmed by you)",
-            text_color=theme.SUCCESS,
+        self.ref_lbl.setText(
+            f"Sample: {path.name}  ·  {self.ref_duration:.1f}s  "
+            "(authorised use confirmed by you)"
         )
+        self.ref_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         self.toast("Voice sample accepted.", "ok")
         if self.player_bar is not None:
             try:
@@ -318,17 +531,17 @@ class MyVoiceScreen(Screen):
                 pass
 
     def _on_consent(self) -> None:
-        granted = bool(self._consent_var.get())
+        granted = self._consent_var.get()
         self.app.settings.set("clone", "consent", granted)
         if granted:
-            self.consent_lbl.configure(
-                text="Consent recorded. You may now create a profile and generate speech.",
-                text_color=theme.SUCCESS,
+            self.consent_lbl.setText(
+                "Consent recorded. You may now create a profile and generate speech."
             )
+            self.consent_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         else:
-            self.consent_lbl.configure(text="Consent required before generating.", text_color=theme.WARNING)
+            self.consent_lbl.setText("Consent required before generating.")
+            self.consent_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
 
-    # --------------------------------------------------------- create profile
     def _create_profile(self) -> None:
         if not self._consent_var.get():
             self.toast("Please confirm voice-use consent first.", "warn")
@@ -336,22 +549,21 @@ class MyVoiceScreen(Screen):
         if self.ref_path is None:
             self.toast("Record or upload a voice sample first.", "warn")
             return
-
         self.create_profile_btn.set_busy(True, "Creating profile…")
         try:
-            dest = file_service.unique_path(
+            destination = file_service.unique_path(
                 file_service.category_dir("voices"), "voice_profile", "wav"
             )
             if self.ref_path.suffix.lower() == ".wav":
-                dest.write_bytes(self.ref_path.read_bytes())
+                destination.write_bytes(self.ref_path.read_bytes())
             else:
-                audio_utils.convert_format(self.ref_path, dest)
-            self.profile_path = dest
-            self.app.settings.set("clone", "profile", str(dest))
-            self.ref_lbl.configure(
-                text=f"Profile saved: {dest.name}  (reference: {self.ref_path.name})",
-                text_color=theme.SUCCESS,
+                audio_utils.convert_format(self.ref_path, destination)
+            self.profile_path = destination
+            self.app.settings.set("clone", "profile", str(destination))
+            self.ref_lbl.setText(
+                f"Profile saved: {destination.name}  (reference: {self.ref_path.name})"
             )
+            self.ref_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
             self._load_clone_model()
             self.toast("Voice profile created.", "ok")
         except Exception as exc:
@@ -360,131 +572,221 @@ class MyVoiceScreen(Screen):
             self.create_profile_btn.set_busy(False)
 
     def _load_clone_model(self) -> None:
-        state = self.app.cloner.state
-        if state in (CloneState.READY, CloneState.LOADING):
+        if not self.app.settings.get("clone", "enabled", True):
+            self.toast(
+                "Voice cloning is off (heavy / experimental). "
+                "Enable it in Settings on a high-RAM machine to use real cloning.",
+                "warn",
+            )
+            return
+        engine = self.app.active_cloner
+        if engine.state in (CloneState.READY, CloneState.LOADING):
             self._refresh_clone_state()
             return
 
         def on_change(state, message):
-            self.app.schedule(lambda: self._apply_clone_state(state, message))
+            self.app.schedule(self._apply_clone_state, state, message)
 
-        self.app.cloner.load_background(on_change)
+        engine.load_background(on_change)
         self._refresh_clone_state()
 
     def _refresh_clone_state(self) -> None:
-        state = self.app.cloner.state
-        message = self.app.cloner.error or {
+        engine = self.app.active_cloner
+        state = engine.state
+        message = engine.error or {
             CloneState.NOT_LOADED: "Model not loaded yet.",
-            CloneState.LOADING: "Loading voice-cloning model… first run downloads ~2 GB.",
+            CloneState.LOADING: (
+                "Loading voice-cloning model… first run downloads the weights."
+            ),
             CloneState.READY: "Voice-cloning model ready.",
-            CloneState.ERROR: "Voice cloning unavailable — a neural fallback voice will be used.",
+            CloneState.ERROR: (
+                "Voice cloning unavailable — a neural fallback voice will be used."
+            ),
         }.get(state, "")
         self._apply_clone_state(state, message)
 
     def _apply_clone_state(self, state, message: str) -> None:
         colors = {
-            CloneState.NOT_LOADED: (theme.SUBTEXT, "edge-tts"),
+            CloneState.NOT_LOADED: (theme.SUBTEXT, "pyttsx3"),
             CloneState.LOADING: (theme.WARNING, "fallback-clone"),
             CloneState.READY: (theme.SUCCESS, "clone"),
             CloneState.ERROR: (theme.DANGER, "fallback-clone"),
         }
-        color, badge = colors.get(state, (theme.SUBTEXT, "edge-tts"))
-        self.clone_status_lbl.configure(text=message, text_color=color)
-        self.clone_state_badge.destroy()
-        self.clone_state_badge = MethodBadge(self.clone_state_badge.master, badge)
-        self.clone_state_badge.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 6))
+        color, badge_method = colors.get(state, (theme.SUBTEXT, "pyttsx3"))
+        self.clone_status_lbl.setText(message)
+        self.clone_status_lbl.setStyleSheet(theme.label_style(color, "left"))
+        old = self.clone_state_badge
+        parent = old.parentWidget()
+        old.hide()
+        old.deleteLater()
+        badge = MethodBadge(parent, badge_method)
+        parent_layout = parent.layout() if parent is not None else None
+        if parent_layout is not None:
+            parent_layout.addWidget(badge)
+        self.clone_state_badge = badge
 
-    # ------------------------------------------------------------- generate
     def _generate(self) -> None:
         if self._generating:
             return
+        if not self.app.settings.get("clone", "enabled", True):
+            self.toast(
+                "Voice cloning is disabled (heavy / experimental) — "
+                "using an offline system voice instead.",
+                "warn",
+            )
         if not self._consent_var.get():
             self.toast("Voice-use consent is required.", "warn")
             return
-
-        text = self.gen_text.get("1.0", "end-1c").strip()
+        text = self.gen_text.get().strip()
         if not text:
             self.toast("Enter text to generate.", "warn")
             return
-        profile = self.profile_path
-        if profile is None and self.ref_path is not None:
-            profile = self.ref_path
+        profile = self.profile_path or self.ref_path
         if profile is None or not Path(profile).exists():
             self.toast("Create a voice profile first.", "warn")
             return
-
-        lang_code = self.clone_lang_menu.get().split("(")[-1].rstrip(")").strip()
-        if not lang_code:
-            lang_code = "en"
+        lang_code = (
+            self.clone_lang_menu.currentText().split("(")[-1].rstrip(")").strip()
+            or "en"
+        )
+        self._gen_lang = lang_code
         self._generating = True
         self.generate_btn.set_busy(True, "Generating…")
-
-        if self.app.cloner.state == CloneState.READY:
-            dest = file_service.unique_path(
+        engine = self.app.active_cloner
+        if (
+            engine.state == CloneState.READY
+            and lang_code in engine.supported_languages()
+        ):
+            destination = file_service.unique_path(
                 file_service.category_dir("clones"),
-                file_service.timestamp_stem("my_voice"), "wav",
+                file_service.timestamp_stem("my_voice"),
+                "wav",
             )
-            self.gen_status_lbl.configure(
-                text="Voice cloning in use — synthesising from your reference recording…",
-                text_color=theme.ACCENT,
+            self.gen_status_lbl.setText(
+                "Voice cloning in use — synthesising from your reference recording…"
             )
-            self.app.cloner.synthesize(
-                text=text,
-                reference_wav=profile,
-                language=lang_code,
-                output_path=dest,
-                on_change=lambda m: self.app.schedule(lambda: self.gen_status_lbl.configure(text=m, text_color=theme.ACCENT)),
-                on_done=lambda path, exc: self.app.schedule(
-                    lambda: self._on_clone_done(dest, path, exc)
-                ),
-            )
+            self.gen_status_lbl.setStyleSheet(theme.label_style(theme.ACCENT, "left"))
+            try:
+                engine.synthesize(
+                    text=text,
+                    reference_wav=profile,
+                    language=lang_code,
+                    output_path=destination,
+                    transcript=self.transcript_entry.text(),
+                    on_change=lambda message: self.app.schedule(
+                        self._set_generation_status, message, theme.ACCENT
+                    ),
+                    on_done=lambda path, exc: self.app.schedule(
+                        self._on_clone_done, destination, path, exc, text
+                    ),
+                )
+            except Exception as exc:
+                self._on_clone_done(destination, None, exc, text)
             return
         self._fallback_generate(text, lang_code)
 
-    def _fallback_generate(self, text: str, lang_code: str) -> None:
-        voice = self._fallback_voice()
-        self.gen_status_lbl.configure(
-            text="⚠ Voice cloning unavailable — using a neural fallback voice instead.",
-            text_color=theme.WARNING,
-        )
-        future = self.app.tts.synthesize_async(text, voice, 1.0, 0)
-        self.run_between(future, on_success=self._on_fallback_done, on_error=self._on_generation_error)
+    def _set_generation_status(self, message: str, color: str) -> None:
+        self.gen_status_lbl.setText(message)
+        self.gen_status_lbl.setStyleSheet(theme.label_style(color, "left"))
 
-    def _on_clone_done(self, dest: Path, path, exc) -> None:
+    def _fallback_generate(self, text: str, lang_code: str) -> None:
+        if lang_code and not self._has_voice_for(lang_code):
+            # A fallback voice for some *other* language would read the text in
+            # the wrong accent, so name the gap instead of generating nonsense.
+            self._generating = False
+            self.generate_btn.set_busy(False)
+            label = language_display_name(lang_code)
+            if PiperVoiceLibrary().can_never_speak(lang_code):
+                # No download could ever fix this, so do not offer one.
+                self._set_get_voice_button(label, lang_code, visible=False)
+                self.gen_status_lbl.setText(
+                    f"No offline {label} voice is published, so {label} text "
+                    f"cannot be spoken aloud."
+                )
+                self.toast(f"No {label} voice exists.", "warn")
+            else:
+                self.gen_status_lbl.setText(
+                    f"No {label} voice is installed, so this text cannot be "
+                    f"spoken correctly. Download one (~60 MB) to hear it."
+                )
+                self._set_get_voice_button(label, lang_code, visible=True)
+                self.toast(f"No {label} voice installed.", "warn")
+            self.gen_status_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+            return
+        self._set_get_voice_button(language_display_name(lang_code or "en"), lang_code or "en", visible=False)
+        self._generating = True
+        self.generate_btn.set_busy(True, "Generating fallback…")
+        voice = self._fallback_voice(lang_code)
+        self.gen_status_lbl.setText(
+            "Voice cloning unavailable — using a neural fallback voice instead."
+        )
+        self.gen_status_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+        try:
+            future = self.app.tts.synthesize_async(text, voice, 1.0, 0)
+        except Exception as exc:
+            self._on_generation_error(exc)
+            return
+        self.run_between(future, self._on_fallback_done, self._on_generation_error)
+
+    def _has_voice_for(self, code: str) -> bool:
+        """True when some installed voice can speak this language."""
+        try:
+            return bool(self.app.tts.voices(code))
+        except Exception:  # noqa: BLE001 - a refresh failure must not crash
+            return False
+
+    def _set_get_voice_button(self, label: str, code: str, visible: bool) -> None:
+        if not hasattr(self, "get_voice_btn"):
+            return
+        self.get_voice_btn.setVisible(visible)
+        article = "an" if label[:1].lower() in "aeiou" else "a"
+        self.get_voice_btn.setText(f"Get {article} {label} voice")
+        self.get_voice_btn.setProperty("language", code)
+        self.get_voice_btn.style().unpolish(self.get_voice_btn)
+        self.get_voice_btn.style().polish(self.get_voice_btn)
+
+    def _on_get_voice(self) -> None:
+        code = self.get_voice_btn.property("language") or self._gen_lang or "en"
+        self._set_get_voice_button(language_display_name(code), code, visible=False)
+        self.app.show_screen("voices", language=code)
+
+    def _on_clone_done(self, destination: Path, path, exc, text: str) -> None:
         self._generating = False
         self.generate_btn.set_busy(False)
         if exc is not None or path is None:
-            self.gen_status_lbl.configure(text=f"Cloning failed: {exc}", text_color=theme.DANGER)
+            self.gen_status_lbl.setText(f"Cloning failed: {exc}")
+            self.gen_status_lbl.setStyleSheet(theme.label_style(theme.DANGER, "left"))
             profile = self.profile_path or self.ref_path
             if profile is not None:
-                text = self.gen_text.get("1.0", "end-1c").strip()
-                self._fallback_generate(text, "en")
+                self._fallback_generate(text, self._gen_lang or "en")
             return
-        self._last_result = {"file": str(dest), "method": "clone"}
-        self._result_badge("clone")
-        self._history_entry("clone", text)
-        self._preview(dest)
-        self.gen_status_lbl.configure(text="Voice Clone generated from your reference voice.", text_color=theme.SUCCESS)
+        self._last_result = {"file": str(destination), "method": self._clone_method()}
+        self._result_badge(self._clone_method())
+        self._history_entry(self._clone_method(), text)
+        self._preview(destination)
+        self.gen_status_lbl.setText("Voice Clone generated from your reference voice.")
+        self.gen_status_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         self.toast("Voice Clone ready.", "ok")
 
     def _on_fallback_done(self, result: dict) -> None:
         self._generating = False
         self.generate_btn.set_busy(False)
-        text = self.gen_text.get("1.0", "end-1c").strip()
+        text = self.gen_text.get().strip()
         self._last_result = {"file": result["file"], "method": "fallback-clone"}
         self._result_badge("fallback-clone")
         self._history_entry("fallback-clone", text)
         self._preview(Path(result["file"]))
-        self.gen_status_lbl.configure(
-            text="Fallback voice used (clone model unavailable). Audio preview ready.",
-            text_color=theme.WARNING,
+        self.gen_status_lbl.setText(
+            "Fallback voice used (clone model unavailable). Audio preview ready."
         )
+        self.gen_status_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
         self.toast("Generated with fallback voice.", "ok")
 
     def _on_generation_error(self, exc: Exception) -> None:
         self._generating = False
         self.generate_btn.set_busy(False)
-        self.gen_status_lbl.configure(text=str(exc), text_color=theme.DANGER)
+        self.gen_status_lbl.setText(str(exc))
+        self.gen_status_lbl.setStyleSheet(theme.label_style(theme.DANGER, "left"))
         self.toast("Generation failed.", "error")
 
     def _preview(self, path: Path) -> None:
@@ -494,10 +796,23 @@ class MyVoiceScreen(Screen):
             except Exception:
                 pass
 
+    def _clone_method(self) -> str:
+        return (
+            "qwen-clone"
+            if self.app.settings.get("clone", "engine", "xtts") == "qwen"
+            else "clone"
+        )
+
     def _result_badge(self, method: str) -> None:
-        self.result_badge.destroy()
-        self.result_badge = MethodBadge(self.result_badge.master, method)
-        self.result_badge.grid(row=3, column=1, sticky="w", padx=4, pady=(0, 14))
+        old = self.result_badge
+        parent = old.parentWidget()
+        old.hide()
+        old.deleteLater()
+        badge = MethodBadge(parent, method)
+        parent_layout = parent.layout() if parent is not None else None
+        if parent_layout is not None:
+            parent_layout.addWidget(badge)
+        self.result_badge = badge
 
     def _history_entry(self, method: str, text: str) -> None:
         self.app.history.create(
@@ -506,24 +821,34 @@ class MyVoiceScreen(Screen):
             title=text[:60],
             text=text,
             file=self._last_result["file"],
-            params={"reference": str(self.profile_path or self.ref_path or ""),
-                    "consent": bool(self._consent_var.get())},
+            params={
+                "reference": str(self.profile_path or self.ref_path or ""),
+                "consent": bool(self._consent_var.get()),
+            },
         )
 
     def _save_result(self) -> None:
         if self._last_result is None:
             self.toast("Generate audio first.", "warn")
             return
-        src = Path(self._last_result["file"])
-        dest = file_service.unique_path(
+        source = Path(self._last_result["file"])
+        destination = file_service.unique_path(
             file_service.category_dir("clones"),
-            file_service.timestamp_stem("my_voice_save"), "wav",
+            file_service.timestamp_stem("my_voice_save"),
+            "wav",
         )
         self.save_btn.set_busy(True, "Saving…")
         try:
-            dest.write_bytes(src.read_bytes())
-            self.toast(f"Saved: {dest.name}", "ok")
+            destination.write_bytes(source.read_bytes())
+            self.toast(f"Saved: {destination.name}", "ok")
         except Exception as exc:
             self.toast(str(exc), "error")
         finally:
             self.save_btn.set_busy(False)
+
+    @staticmethod
+    def _set_items(combo: QComboBox, values: list[str]) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(values)
+        combo.blockSignals(False)

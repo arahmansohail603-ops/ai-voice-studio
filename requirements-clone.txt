@@ -1,6 +1,17 @@
-# Optional: real voice cloning ("My Voice" workflow).
-# Installs torch + Coqui TTS (large download). The XTTS-v2 model (~2 GB)
-# downloads automatically on first use. Without these, the app falls back
-# to a neural voice and clearly labels the result as "Fallback Voice".
-TTS>=0.22.0
-torch>=2.1.0
+# The Qwen3-TTS Base engine (selectable in Settings → My Voice → Clone engine,
+# and the default TTS engine) uses the `qwen-tts` package. It auto-uses an
+# NVIDIA CUDA GPU when one is available; otherwise it falls back to the
+# (slow) CPU.
+#   - NVIDIA GPU? Install a CUDA build of torch first (fast):
+#       pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   - Then: pip install -r requirements-clone.txt
+#   - Install FlashAttention for the fastest GPU inference (optional):
+#       pip install flash-attn --no-build-isolation
+# CPU-only machines work but syntax is slow — a System or Piper voice is a
+# better default there.
+
+coqui-tts>=0.27.5
+torch>=2.9.0
+torchcodec>=0.16.0
+transformers>=4.57,<5
+qwen-tts>=0.1.1

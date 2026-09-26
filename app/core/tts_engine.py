@@ -1,81 +1,169 @@
-"""Text-to-speech engine.
+"""Text-to-speech engine — fully offline, no Microsoft services.
 
-Primary backend:  ``edge-tts`` (Microsoft neural voices — dozens of languages
-and voices, supports speed *and* pitch). Requires internet.
+Primary backend: **Qwen3-TTS Base** (local neural voices, offline). The model
+lives in the app's ``models/huggingface`` hub cache; synthesis uses a reference
+voice (a neutral sample generated once from the offline system voice, or your
+own recorded My Voice profile).
 
-Fallback backend: ``pyttsx3`` (fully offline, system voices, no pitch).
-The engine automatically switches when edge-tts is missing or the network
-request fails, and exposes a ``mode`` property so the UI can tell the user
-exactly which backend produced the audio.
+Backup backends:
+- **system voices via ``pyttsx3``** (Windows SAPI5 / macOS ``say`` /
+  Linux espeak). No download, no internet, no account.
+- **Piper** neural voices (offline). Used only when the ``piper`` package is
+  installed *and* a voice model exists in ``models/piper-voices/``.
+
+The public API is unchanged: ``voices()``, ``languages()``, ``mode``,
+``refresh_voices_async()`` and ``synthesize_async()``.
 """
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import subprocess
+import sys
 from concurrent.futures import Future
 from pathlib import Path
-from typing import List, Optional
 
+from app.config import PIPER_VOICE_DIR, QWEN_DEFAULT_REF_VOICE, QWEN_GPU_ONLY
 from app.core.async_runner import AsyncRunner
 from app.core.errors import (
+    AppError,
     MissingDependencyError,
-    NetworkError,
     TTSGenerationError,
-    module_available,
+    module_installed,
     soft_import,
 )
+from app.core.qwen_cloner import QWEN_LANGUAGE_NAMES, QwenVoiceCloner
+from app.core.voice_cloner import CloneState
 from app.services import file_service
 
 
-def _safe_attr(obj, *names, default=""):
-    for name in names:
-        if isinstance(obj, dict):
-            if name in obj:
-                return obj[name]
-        else:
-            if hasattr(obj, name):
-                value = getattr(obj, name)
-                if value is not None:
-                    return value
-    return default
+def _last_lines(raw, count: int = 2) -> str:
+    """The final ``count`` meaningful lines of subprocess output.
+
+    A traceback's cause is at the bottom; the top is just frames. Truncating
+    from the front is what hid the real reason Piper synthesis failed.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    lines = [line.strip() for line in str(raw).splitlines() if line.strip()]
+    return " ".join(lines[-count:])[:200]
 
 
 class TTSEngine:
-    """High-level TTS service with automatic edge-tts -> pyttsx3 fallback."""
+    """Offline neural TTS (Qwen3-TTS) with system and Piper backups."""
 
-    MODE_EDGE = "edge-tts"
-    MODE_PYTTSSX3 = "pyttsx3"
+    MODE_SYSTEM = "pyttsx3"
+    MODE_PYTTSSX3 = MODE_SYSTEM  # backwards-compatible alias
+    MODE_PIPER = "piper"
+    MODE_QWEN = "qwen3-tts"
 
-    def __init__(self, runner: AsyncRunner, output_dir: Path):
+    def __init__(
+        self,
+        runner: AsyncRunner,
+        output_dir: Path,
+        backend: str = "system",
+        qwen=None,
+        settings=None,
+    ):
         self.runner = runner
         self.output_dir = output_dir
-        self._voices: List[dict] = []
-        self._languages: List[str] = []
-        self._mode = self.MODE_EDGE
-        self._edge_available = module_available("edge_tts")
-        if not self._edge_available:
+        self.backend = (backend or "system").strip().lower()
+        self._voices: list[dict] = []
+        self._languages: list[str] = []
+        self._mode = self.MODE_PYTTSSX3
+        self._qwen = qwen  # optional shared QwenVoiceCloner (model loaded once)
+        self._settings = settings  # optional SettingsService for saved references
+        self._qwen_available = module_installed("qwen_tts")
+        self._piper_available = module_installed("piper")
+        self._load_local_voices()
+        self._load_qwen_voices()
+        self._set_mode_from_backend()
+
+    # ------------------------------------------------------------- backends
+    @classmethod
+    def available_backends(cls, manager=None) -> list[str]:
+        """Backends usable on this machine (offline first).
+
+        ``system`` needs nothing. ``piper`` and ``qwen3`` additionally need their
+        model to be installed through the Models screen, so they are only listed
+        when at least one matching model is present on disk.
+        """
+        backends = ["system"]
+        if module_installed("piper") and cls._has_model(manager, kind="tts", engine="piper"):
+            backends.append("piper")
+        if module_installed("qwen_tts") and cls._has_model(manager, kind="tts", engine="qwen3"):
+            backends.append("qwen3")
+        return backends
+
+    @staticmethod
+    def _has_model(manager, *, kind: str, engine: str) -> bool:
+        from app.core.model_manager import get_manager
+
+        try:
+            return (manager or get_manager()).find_installed(
+                kind=kind, engine=engine
+            ) is not None
+        except AppError:
+            return False
+
+    def backend_status(self, backend: str, manager=None) -> str:
+        """Explain why a backend is or is not selectable."""
+        if backend == "system":
+            return "Ready — uses the Windows voices already installed."
+        if backend == "piper":
+            if not module_installed("piper"):
+                return "The 'piper' package is not installed."
+            if not self._has_model(manager, kind="tts", engine="piper"):
+                return "No Piper voice installed — add one from the Models screen."
+            return "Ready"
+        if backend == "qwen3":
+            if not module_installed("qwen_tts"):
+                return "The 'qwen_tts' package is not installed."
+            if not self._has_model(manager, kind="tts", engine="qwen3"):
+                return "Qwen3-TTS is not installed — download it from the Models screen."
+            if QWEN_GPU_ONLY and not self.qwen_gpu_present:
+                return "Qwen3-TTS needs an NVIDIA GPU (GPU-only mode is on)."
+            return "Ready"
+        return f"Unknown text-to-speech backend '{backend}'."
+
+    def set_backend(self, backend: str) -> None:
+        self.backend = (backend or "system").strip().lower()
+        self._set_mode_from_backend()
+
+    def _set_mode_from_backend(self) -> None:
+        if self.backend == "piper" and self._piper_available:
+            self._mode = self.MODE_PIPER
+        elif self.backend == "qwen3" and self.qwen_gpu_ready():
+            self._mode = self.MODE_QWEN
+        else:
             self._mode = self.MODE_PYTTSSX3
-            self._load_local_voices()
+
+    def qwen_gpu_ready(self) -> bool:
+        """Qwen3-TTS is usable whenever the ``qwen_tts`` package is installed.
+        It auto-uses an NVIDIA CUDA GPU when present, otherwise the CPU."""
+        if not (self._qwen_available and self._qwen is not None):
+            return False
+        if QWEN_GPU_ONLY:
+            return QwenVoiceCloner._cuda_available()
+        return True
+
+    @property
+    def qwen_gpu_present(self) -> bool:
+        """True when an NVIDIA CUDA GPU is available for Qwen3-TTS."""
+        if not (self._qwen_available and self._qwen is not None):
+            return False
+        return QwenVoiceCloner._cuda_available()
 
     # ------------------------------------------------------------------ queue
     def refresh_voices_async(self, on_done) -> Future:
-        """Reload voices off the GUI thread; calls ``on_done()`` when ready."""
+        """(Re)load voices off the GUI thread; calls ``on_done()`` when ready."""
 
         async def _fetch():
-            if not self._edge_available:
-                self._mode = self.MODE_PYTTSSX3
-                self._load_local_voices()
-                return
-            try:
-                import edge_tts
-
-                raw = await edge_tts.list_voices()
-                self._voices = [self._normalize_edge(v) for v in raw]
-                self._mode = self.MODE_EDGE
-            except Exception:
-                # edge-tts installed but unreachable/errored -> offline fallback
-                self._mode = self.MODE_PYTTSSX3
-                if not self._voices:
-                    self._load_local_voices()
+            self._load_local_voices()
+            self._load_qwen_voices()
+            self._set_mode_from_backend()
 
         future = self.runner.run(_fetch())
         try:
@@ -85,61 +173,124 @@ class TTSEngine:
         return future
 
     # ---------------------------------------------------------------- voices
-    @staticmethod
-    def _normalize_edge(voice) -> dict:
-        locale = str(_safe_attr(voice, "locale", "Locale"))
-        short_name = str(_safe_attr(voice, "short_name", "ShortName"))
-        friendly = str(_safe_attr(voice, "friendly_name", "FriendlyName", "name", "Name"))
-        gender = str(_safe_attr(voice, "gender", "Gender", "Female"))
-        return {
-            "short_name": short_name,
-            "friendly": friendly or short_name,
-            "gender": gender,
-            "locale": locale,
-            "language": locale.split("-")[0].lower(),
-            "source": "edge",
-        }
-
-    def _load_local_voices(self) -> None:
+    def _collect_local_voices(self) -> list[dict]:
+        """System (pyttsx3) voices without touching ``self._voices``."""
         pyttsx3 = soft_import("pyttsx3")
-        self._voices = []
+        result = []
+        if pyttsx3 is None:
+            return result
         try:
             engine = pyttsx3.init()
-            for voice in engine.getProperty("voices"):
-                vid = str(getattr(voice, "id", voice))
-                name = str(getattr(voice, "name", "System voice"))
-                langs = list(getattr(voice, "languages", []) or [])
-                locale = ""
-                if langs:
-                    raw = langs[0]
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8", "replace")
-                    raw = str(raw).replace("_", "-").split(".")[0]
-                    locale = raw
-                if not locale:
-                    locale = "en-US"
-                self._voices.append(
-                    {
-                        "short_name": vid,
-                        "friendly": name,
-                        "gender": str(getattr(voice, "gender", "") or ""),
-                        "locale": locale,
-                        "language": locale.split("-")[0].lower(),
-                        "source": "pyttsx3",
-                    }
-                )
+            try:
+                for voice in engine.getProperty("voices"):
+                    vid = str(getattr(voice, "id", voice))
+                    name = str(getattr(voice, "name", "System voice"))
+                    langs = list(getattr(voice, "languages", []) or [])
+                    locale = ""
+                    if langs:
+                        raw = langs[0]
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", "replace")
+                        raw = str(raw).replace("_", "-").split(".")[0]
+                        locale = raw
+                    if not locale:
+                        locale = "en-US"
+                    result.append(
+                        {
+                            "short_name": vid,
+                            "friendly": name,
+                            "gender": str(getattr(voice, "gender", "") or ""),
+                            "locale": locale,
+                            "language": locale.split("-")[0].lower(),
+                            "source": "pyttsx3",
+                        }
+                    )
+            finally:
+                engine.stop()
         except Exception:
-            self._voices = []
+            return []
+        return result
 
-    def voices(self, language: Optional[str] = None) -> List[dict]:
-        if not language:
+    def _collect_piper_voices(self) -> list[dict]:
+        """Piper voices found on disk (``models/piper-voices/*.onnx``)."""
+        result: list[dict] = []
+        if not PIPER_VOICE_DIR.is_dir():
+            return result
+        for model in sorted(PIPER_VOICE_DIR.glob("*.onnx")):
+            name = model.stem
+            config = model.with_suffix(".onnx.json")
+            language = "en"
+            if not config.exists():
+                config = model.parent / f"{name}.onnx.json"
+            try:
+                import json
+
+                if config.exists():
+                    with open(config, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    language = str(meta.get("language", {}).get("code", "en"))
+                    language = language.split("-")[0].split("_")[0].lower() or "en"
+            except Exception:
+                pass
+            result.append(
+                {
+                    "short_name": name,
+                    "friendly": name.replace("_", " ").title(),
+                    "gender": "",
+                    "locale": language,
+                    "language": language,
+                    "source": "piper",
+                    "path": str(model),
+                }
+            )
+        return result
+
+    def _load_local_voices(self) -> None:
+        voices = self._collect_local_voices()
+        # A Piper voice on disk is useless without the package to run it, so it
+        # must not reach a dropdown where picking it guarantees a failure.
+        if self._piper_available:
+            voices.extend(self._collect_piper_voices())
+        self._voices = voices
+
+    def _load_qwen_voices(self) -> None:
+        """Static tokens, one per Qwen3-TTS supported language (GPU only)."""
+        if not self.qwen_gpu_ready():
+            return
+        seen = {v.get("short_name") for v in self._voices}
+        for code, name in QWEN_LANGUAGE_NAMES.items():
+            short = f"qwen-{code}"
+            if short in seen:
+                continue
+            self._voices.append(
+                {
+                    "short_name": short,
+                    "friendly": f"Qwen3-TTS ({name})",
+                    "gender": "",
+                    "locale": code,
+                    "language": code,
+                    "source": "qwen",
+                }
+            )
+
+    def _viewable_voices(self) -> list[dict]:
+        """Voices selectable for the active engine. Qwen voices are hidden
+        unless the Qwen3-TTS engine is selected, so a stale selection can
+        never trigger a (very slow) CPU run."""
+        if self.backend == "qwen3":
             return list(self._voices)
-        return [v for v in self._voices if v["language"] == language.lower()]
+        return [v for v in self._voices if v.get("source") != "qwen"]
 
-    def languages(self) -> List[str]:
-        """Unique language codes found among loaded voices, first-seen order."""
+    def voices(self, language: str | None = None) -> list[dict]:
+        pool = self._viewable_voices()
+        if not language:
+            return pool
+        return [v for v in pool if v["language"] == language.lower()]
+
+    def languages(self) -> list[str]:
+        """Unique language codes found among viewable voices, first-seen order."""
         seen = []
-        for v in self._voices:
+        for v in self._viewable_voices():
             if v["language"] and v["language"] not in seen:
                 seen.append(v["language"])
         return seen
@@ -152,25 +303,46 @@ class TTSEngine:
     def voices_loaded(self) -> bool:
         return bool(self._voices)
 
-    def find_voice(self, short_name: str) -> Optional[dict]:
+    def find_voice(self, short_name: str) -> dict | None:
         for v in self._voices:
             if v["short_name"] == short_name:
                 return v
         return None
 
+    def voice_usable(self, short_name: str) -> bool:
+        """True when ``short_name`` is a voice this machine can actually speak.
+
+        Guards saved settings: a name that is no longer offered (its engine was
+        uninstalled, or the model was deleted) must be re-resolved rather than
+        handed to the synthesiser, which would fail mid-generation.
+        """
+        voice = self.find_voice(short_name)
+        if voice is None:
+            return False
+        source = voice.get("source")
+        if source == "piper":
+            return self._piper_available
+        if source == "qwen":
+            return self.qwen_gpu_ready()
+        return True
+
+    def _system_fallback_voice(self, language: str = "") -> str | None:
+        """Best system (pyttsx3) voice in ``language``, or any offline voice."""
+        if not any(v.get("source") == "pyttsx3" for v in self._voices):
+            local = self._collect_local_voices()
+            if local:
+                seen = {v.get("short_name") for v in self._voices}
+                self._voices.extend(v for v in local if v.get("short_name") not in seen)
+        for v in self.voices(language) or list(self._voices):
+            if v.get("source") == "pyttsx3":
+                return v.get("short_name") or v.get("id")
+        for v in self._voices:
+            if v.get("source") == "pyttsx3":
+                return v.get("short_name")
+        return None
+
     # ------------------------------------------------------------- synthesis
-    @staticmethod
-    def rate_string(speed: float) -> str:
-        percent = int(round((speed - 1.0) * 100))
-        percent = max(-90, min(200, percent))
-        return f"{percent:+d}%"
-
-    @staticmethod
-    def pitch_string(pitch: int) -> str:
-        pitch = max(-50, min(50, int(pitch)))
-        return f"{pitch:+d}Hz"
-
-    def _default_path(self, ext: str = "mp3") -> Path:
+    def _default_path(self, ext: str = "wav") -> Path:
         return file_service.unique_path(
             self.output_dir, file_service.timestamp_stem("tts"), ext
         )
@@ -181,56 +353,268 @@ class TTSEngine:
         voice_short_name: str,
         speed: float = 1.0,
         pitch: int = 0,
-        output_path: Optional[str | Path] = None,
+        output_path: str | Path | None = None,
     ) -> dict:
-        """Synthesize speech. Returns metadata dict {file, mode, voice, ...}."""
+        """Synthesize speech. Returns metadata dict {file, mode, voice, ...}.
+
+        All backends are offline. A ``source == "qwen"`` voice uses the local
+        Qwen3-TTS model; any failure falls back to the offline system voice.
+        """
         text = (text or "").strip()
         if not text:
             raise TTSGenerationError("Please enter some text to convert.")
 
         voice = self.find_voice(voice_short_name) or {}
-        source = voice.get("source", "edge")
+        source = voice.get("source") or self._default_source()
+        if source == "qwen" and self.backend != "qwen3":
+            # A stale qwen-* voice must never launch the slow model when the
+            # selected engine is not Qwen3-TTS — use an offline system voice.
+            voice = {}
+            source = "pyttsx3"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        if source == "pyttsx3":
-            self._mode = self.MODE_PYTTSSX3
-            path = self._pyttsx3_synth(text, voice_short_name, speed, output_path)
-            return {"file": str(path), "mode": self.MODE_PYTTSSX3, "voice": voice_short_name}
+        if source == "piper":
+            self._mode = self.MODE_PIPER
+            path = self._piper_synth(text, voice, speed, output_path)
+            return {"file": str(path), "mode": self.MODE_PIPER, "voice": voice_short_name}
 
-        if not self._edge_available:
-            raise MissingDependencyError(
-                "edge_tts", "edge-tts",
-                detail="Try again later or install edge-tts for neural voices.",
+        if source == "qwen":
+            return await self._qwen_synthesize(
+                text, voice, speed, output_path
             )
 
+        self._mode = self.MODE_PYTTSSX3
+        used = voice_short_name
+        if not voice:
+            # The requested voice has no entry (e.g. a qwen-* name on a
+            # GPU-less machine) — resolve it to a real offline system voice.
+            lang = voice_short_name.split("-", 1)[1] if voice_short_name.startswith("qwen-") else ""
+            used = self._system_fallback_voice(lang or "en") or voice_short_name
+        path = self._pyttsx3_synth(text, used, speed, output_path)
+        return {"file": str(path), "mode": self.MODE_PYTTSSX3, "voice": used}
+
+    def _default_source(self) -> str:
+        if self.backend == "piper" and self._piper_available:
+            return "piper"
+        if self.backend == "qwen3" and self.qwen_gpu_ready():
+            return "qwen"
+        return "pyttsx3"
+
+    # ------------------------------------------------------------ qwen synthesis
+    async def _qwen_synthesize(
+        self,
+        text: str,
+        voice: dict,
+        speed: float,
+        output_path: str | Path | None,
+    ) -> dict:
+        """Offline Qwen3-TTS synthesis via the shared voice-clone model."""
+        language = voice.get("language") or "en"
+        voice_short_name = voice.get("short_name") or f"qwen-{language}"
+
+        if not self.qwen_gpu_ready():
+            return await self._qwen_fallback(
+                text, language, speed, output_path,
+                "Qwen3-TTS is not installed or unavailable on this device.",
+            )
+
+        reference = await asyncio.to_thread(self._ensure_qwen_reference)
+        if reference is None:
+            return await self._qwen_fallback(
+                text, language, speed, output_path,
+                "Could not prepare a Qwen3-TTS reference voice.",
+            )
+
+        state = await self._qwen_wait_ready(timeout=1200.0)
+        if state != CloneState.READY:
+            reason = getattr(self._qwen, "error", "") or "the Qwen3-TTS model could not load."
+            return await self._qwen_fallback(text, language, speed, output_path, reason)
+
+        path = Path(output_path) if output_path else self._default_path("wav")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        pending: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _on_done(done_path: Path | None, exc: Exception | None) -> None:
+            if exc is not None:
+                if not pending.done():
+                    pending.set_exception(exc)
+            else:
+                if not pending.done():
+                    pending.set_result(done_path)
+
+        self._qwen.synthesize(
+            text=text,
+            reference_wav=str(reference),
+            language=language or "en",
+            output_path=path,
+            transcript="",
+            on_change=None,
+            on_done=_on_done,
+        )
         try:
-            import edge_tts
+            await asyncio.wrap_future(pending)
+        except Exception as exc:  # noqa: BLE001 - fall back to system voice
+            return await self._qwen_fallback(
+                text, language, speed, output_path, str(exc)[:120],
+            )
+        if not path.exists() or path.stat().st_size == 0:
+            return await self._qwen_fallback(
+                text, language, speed, output_path, "Qwen3-TTS produced no audio.",
+            )
 
-            rate = self.rate_string(speed)
-            pitch_str = self.pitch_string(pitch)
-            path = Path(output_path) if output_path else self._default_path("mp3")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            comm = edge_tts.Communicate(text, voice_short_name, rate=rate, pitch=pitch_str)
-            await comm.save(str(path))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise NetworkError(
-                "Speech generation failed (edge-tts network error). Check your "
-                f"internet connection. ({exc})"
-            ) from exc
+        self._mode = self.MODE_QWEN
+        return {
+            "file": str(path),
+            "mode": self.MODE_QWEN,
+            "voice": voice_short_name,
+            "language": language,
+        }
 
-        if not Path(path).exists() or Path(path).stat().st_size == 0:
-            raise TTSGenerationError("The speech engine produced no audio output.")
-        self._mode = self.MODE_EDGE
-        return {"file": str(path), "mode": self.MODE_EDGE, "voice": voice_short_name}
+    async def _qwen_wait_ready(self, timeout: float = 1200.0) -> CloneState:
+        """Wait for the shared Qwen model to load; returns its final state."""
+        cloner = self._qwen
+        if cloner is None:
+            return CloneState.ERROR
+        if cloner.state == CloneState.NOT_LOADED:
+            cloner.load_background(on_change=lambda _s, _m: None)
+        waited = 0.0
+        while cloner.state == CloneState.LOADING and waited < timeout:
+            await asyncio.sleep(0.5)
+            waited += 0.5
+        return cloner.state
+
+    def _saved_qwen_reference(self) -> str:
+        if self._settings is None:
+            return ""
+        try:
+            return str(self._settings.get("tts", "qwen_reference", "") or "")
+        except Exception:
+            return ""
+
+    def _ensure_qwen_reference(self) -> Path | None:
+        """Reference voice for Qwen3-TTS: a saved profile, else a generated default."""
+        saved = self._saved_qwen_reference().strip('"')
+        if saved and Path(saved).exists():
+            return Path(saved)
+        if QWEN_DEFAULT_REF_VOICE.exists() and QWEN_DEFAULT_REF_VOICE.stat().st_size > 0:
+            return QWEN_DEFAULT_REF_VOICE
+        try:
+            QWEN_DEFAULT_REF_VOICE.parent.mkdir(parents=True, exist_ok=True)
+            voice = self._system_fallback_voice("en") or ""
+            self._pyttsx3_synth(
+                "This is the default voice for Qwen text to speech.",
+                voice,
+                1.0,
+                QWEN_DEFAULT_REF_VOICE,
+            )
+        except Exception:
+            return None
+        if QWEN_DEFAULT_REF_VOICE.exists() and QWEN_DEFAULT_REF_VOICE.stat().st_size > 0:
+            return QWEN_DEFAULT_REF_VOICE
+        return None
+
+    async def _qwen_fallback(
+        self,
+        text: str,
+        language: str,
+        speed: float,
+        output_path: str | Path | None,
+        reason: str,
+    ) -> dict:
+        """Best-effort offline fallback when Qwen3-TTS cannot be used."""
+        fallback = self._system_fallback_voice(language or "")
+        if not fallback:
+            raise TTSGenerationError(
+                f"Qwen3-TTS unavailable ({reason}) and no offline system voice found."
+            )
+        path = await asyncio.to_thread(
+            self._pyttsx3_synth, text, fallback, speed, output_path
+        )
+        return {
+            "file": str(path),
+            "mode": self.MODE_PYTTSSX3,
+            "voice": fallback,
+            "fallback": True,
+            "fallback_reason": reason,
+            "voice_changed": True,
+            "voice_changed_from": f"qwen-{language or 'en'}",
+        }
+
+    def _piper_synth(
+        self,
+        text: str,
+        voice: dict,
+        speed: float,
+        output_path: str | Path | None = None,
+    ) -> Path:
+        """Offline Piper synthesis via the bundled ``python -m piper`` CLI."""
+        if not self._piper_available:
+            raise MissingDependencyError(
+                "piper",
+                "piper-tts",
+                detail=(
+                    f"The offline voice '{voice.get('short_name', 'this voice')}' "
+                    "needs the Piper package, which is not installed. Install it, "
+                    "or pick a different voice."
+                ),
+            )
+        model = voice.get("path")
+        if not model or not Path(model).exists():
+            raise TTSGenerationError(
+                "No Piper voice model found. Add a *.onnx voice to "
+                f"'{PIPER_VOICE_DIR}' and refresh."
+            )
+        path = Path(output_path) if output_path else self._default_path("wav")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        length_scale = 1.0
+        if speed and speed > 0:
+            length_scale = max(0.5, min(2.0, 1.0 / float(speed)))
+        cmd = [
+            sys.executable, "-m", "piper",
+            "--model", str(model),
+            "--output_file", str(path),
+            "--length_scale", f"{length_scale:.3f}",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                # Piper decodes stdin as UTF-8, so the text has to be encoded as
+                # UTF-8 here too. Passing a str with text=True would encode it
+                # with the Windows locale (cp1252), which mangles every
+                # non-ASCII script to nothing and leaves Piper synthesising
+                # zero audio -- surfacing as a baffling
+                # "wave.Error: # channels not specified".
+                input=text.encode("utf-8"),
+                capture_output=True,
+                timeout=300,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError as exc:
+            raise MissingDependencyError("piper", "piper-tts") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TTSGenerationError("Offline Piper synthesis timed out.") from exc
+        if proc.returncode != 0 or not path.exists() or path.stat().st_size == 0:
+            # A failed run leaves a zero-byte wav behind; the history screen
+            # would then list a silent file as a completed conversion.
+            try:
+                if path.exists() and path.stat().st_size == 0:
+                    path.unlink()
+            except OSError:
+                pass
+            # The tail of the traceback carries the cause; the head is just
+            # boilerplate frames, so truncating from the front hid the reason.
+            detail = _last_lines(proc.stderr or proc.stdout, 2)
+            raise TTSGenerationError(f"Offline Piper synthesis failed. {detail}")
+        return path
 
     def _pyttsx3_synth(
         self,
         text: str,
         voice_id: str,
         speed: float,
-        output_path: Optional[str | Path] = None,
+        output_path: str | Path | None = None,
     ) -> Path:
         pyttsx3_module = soft_import("pyttsx3")
         if pyttsx3_module is None:
@@ -241,10 +625,11 @@ class TTSEngine:
             engine = pyttsx3_module.init()
             engine.setProperty("rate", max(80, int(170 * speed)))
             engine.setProperty("volume", 1.0)
-            try:
-                engine.setProperty("voice", voice_id)
-            except Exception:
-                pass
+            if voice_id:
+                try:
+                    engine.setProperty("voice", voice_id)
+                except Exception:
+                    pass
             engine.save_to_file(text, str(path))
             engine.runAndWait()
             engine.stop()
@@ -261,7 +646,7 @@ class TTSEngine:
         voice_short_name: str,
         speed: float = 1.0,
         pitch: int = 0,
-        output_path: Optional[str | Path] = None,
+        output_path: str | Path | None = None,
     ) -> Future:
         coro = self.synthesize(text, voice_short_name, speed, pitch, output_path)
         return self.runner.run(coro)
@@ -269,12 +654,22 @@ class TTSEngine:
     def prefill_default_voice(self) -> str:
         """A sensible default voice for the current default language."""
         language = "en"
-        for v in self._voices:
+        # Prefer the configured backend's voices first.
+        preferred = {
+            "piper": "piper",
+            "qwen3": "qwen",
+        }.get(self.backend)
+        pool = self._viewable_voices()
+        if preferred:
+            owned = [v for v in pool if v.get("source") == preferred]
+            if owned:
+                pool = owned + [v for v in pool if v.get("source") != preferred]
+        for v in pool:
             if v["language"] == language and v["gender"].lower() in ("female",):
                 return v["short_name"]
-        for v in self._voices:
+        for v in pool:
             if v["language"] == language:
                 return v["short_name"]
-        if self._voices:
-            return self._voices[0]["short_name"]
-        return "en-US-AriaNeural"
+        if pool:
+            return pool[0]["short_name"]
+        return ""

@@ -5,7 +5,6 @@ import json
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
 
 from app import config
 from app.services import file_service
@@ -22,7 +21,7 @@ class HistoryEntry:
         self.id: str = data.get("id", uuid.uuid4().hex)
         self.ts: str = data.get("ts", _now())
         self.type: str = data.get("type", "tts")            # tts|note|transcript|clone
-        self.method: str = data.get("method", "unknown")    # edge-tts|pyttsx3|record|stt|clone
+        self.method: str = data.get("method", "unknown")    # qwen3-tts|pyttsx3|piper|record|stt|clone
         self.title: str = data.get("title", "Untitled")
         self.text: str = data.get("text", "")
         self.file: str = data.get("file", "")
@@ -50,10 +49,10 @@ class HistoryService:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._entries: List[HistoryEntry] = []
+        self._entries: list[HistoryEntry] = []
         self._path = config.history_path()
 
-    def load(self) -> "HistoryService":
+    def load(self) -> HistoryService:
         with self._lock:
             if self._path.exists():
                 try:
@@ -86,7 +85,7 @@ class HistoryService:
         title: str,
         text: str = "",
         file: str = "",
-        params: Optional[dict] = None,
+        params: dict | None = None,
         duration: float = 0.0,
         note: str = "",
     ) -> HistoryEntry:
@@ -102,16 +101,16 @@ class HistoryService:
         )
         return self.add(entry)
 
-    def all(self) -> List[HistoryEntry]:
+    def all(self) -> list[HistoryEntry]:
         with self._lock:
             return list(self._entries)
 
-    def filter(self, entry_type: Optional[str] = None) -> List[HistoryEntry]:
+    def filter(self, entry_type: str | None = None) -> list[HistoryEntry]:
         if not entry_type or entry_type == "all":
             return self.all()
         return [e for e in self.all() if e.type == entry_type]
 
-    def get(self, entry_id: str) -> Optional[HistoryEntry]:
+    def get(self, entry_id: str) -> HistoryEntry | None:
         for e in self.all():
             if e.id == entry_id:
                 return e

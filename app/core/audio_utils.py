@@ -5,7 +5,6 @@ import shutil
 import warnings
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
 
 warnings.filterwarnings("ignore", message=".*Couldn't find ffmpeg.*")
 
@@ -27,7 +26,7 @@ class ConversionError(AppError):
 
 
 @lru_cache(maxsize=1)
-def _cached_ffmpeg_path() -> Optional[str]:
+def _cached_ffmpeg_path() -> str | None:
     """Attempt to locate an ffmpeg binary several ways.
 
     1. On the PATH (pydub's ``which`` does the same search).

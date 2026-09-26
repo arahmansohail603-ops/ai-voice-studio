@@ -1,269 +1,423 @@
-"""Reusable GUI widgets: player bar, badges, busy buttons, toasts, meters."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Callable, Optional
 
-import customtkinter as ctk
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QTextEdit,
+    QWidget,
+)
 
 from app.gui import theme
 
 
 def fmt_clock(seconds: float) -> str:
     seconds = max(0, int(seconds))
-    m, s = divmod(seconds, 60)
-    return f"{m:02d}:{s:02d}"
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes:02d}:{secs:02d}"
 
 
-def bind_future(root, future: Future, on_success: Callable, on_error: Callable) -> None:
-    """Poll a background future and dispatch the result onto the Tk loop."""
+def bind_future(
+    root: QObjectLike, future: Future, on_success: Callable, on_error: Callable
+) -> None:
+    timer = QTimer(root)
+    timer.setInterval(80)
 
-    def _poll() -> None:
-        if future.done():
-            exc = future.exception()
-            if exc is not None:
-                on_error(exc)
-                return
-            on_success(future.result())
+    def poll() -> None:
+        if not future.done():
             return
-        root.after(80, _poll)
+        timer.stop()
+        timer.deleteLater()
+        try:
+            result = future.result()
+        except BaseException as exc:
+            on_error(exc)
+        else:
+            on_success(result)
 
-    root.after(80, _poll)
+    timer.timeout.connect(poll)
+    timer.start()
 
 
-class MethodBadge(ctk.CTkLabel):
-    """Small colored pill identifying how an item was produced."""
+class QObjectLike(QWidget):
+    pass
 
+
+class TextEdit(QTextEdit):
+    def insert(self, position: str = "1.0", text: str = "") -> None:
+        cursor = self.textCursor()
+        if position == "1.0":
+            cursor.movePosition(cursor.Start)
+        self.setTextCursor(cursor)
+        self.insertPlainText(text)
+
+    def get(self, start: str = "1.0", end: str = "end-1c") -> str:
+        if start == "1.0" and end == "end-1c":
+            return self.toPlainText()
+        cursor = self.textCursor()
+        cursor.movePosition(cursor.Start)
+        if end == "end-1c":
+            cursor.movePosition(cursor.End)
+            cursor.movePosition(cursor.PreviousCharacter)
+        return cursor.selectedText().replace("\u2029", "\n")
+
+    def delete(self, start: str = "1.0", end: str = "end") -> None:
+        cursor = self.textCursor()
+        cursor.movePosition(cursor.Start)
+        if end == "end":
+            cursor.movePosition(cursor.End)
+            cursor.removeSelectedText()
+            self.setTextCursor(cursor)
+            return
+        cursor.movePosition(cursor.End)
+        cursor.movePosition(cursor.PreviousCharacter)
+        cursor.movePosition(cursor.Start, cursor.KeepAnchor)
+        cursor.removeSelectedText()
+        self.setTextCursor(cursor)
+
+    def edit_modified(self, value: bool = True) -> None:
+        self.document().setModified(value)
+
+
+class MethodBadge(QLabel):
     COLORS = {
-        "edge-tts": (theme.SUCCESS, "#153226"),
+        "qwen3-tts": (theme.SUCCESS, "#153226"),
         "pyttsx3": (theme.WARNING, "#33260f"),
         "clone": (theme.ACCENT, theme.ACCENT_SOFT),
+        "qwen-clone": (theme.ACCENT, theme.ACCENT_SOFT),
         "fallback-clone": (theme.WARNING, "#33260f"),
         "record": (theme.SUCCESS, "#153226"),
         "stt": (theme.SUCCESS, "#153226"),
     }
 
     LABELS = {
-        "edge-tts": "Neural TTS",
+        "qwen3-tts": "Qwen3-TTS",
         "pyttsx3": "Offline TTS",
         "clone": "Voice Clone",
+        "qwen-clone": "Qwen Voice Clone",
         "fallback-clone": "Fallback Voice",
         "record": "Voice Note",
         "stt": "Transcription",
     }
 
-    def __init__(self, master, method: str, **kwargs):
-        fg, bg = self.COLORS.get(method, (theme.SUBTEXT, theme.INPUT_BG))
+    def __init__(self, master: QWidget | None, method: str, **kwargs):
+        super().__init__(master)
+        foreground, background = self.COLORS.get(
+            method, (theme.SUBTEXT, theme.INPUT_BG)
+        )
         text = self.LABELS.get(method, method)
-        super().__init__(
-            master,
-            text=f"  {text}  ",
-            fg_color=bg,
-            text_color=fg,
-            corner_radius=10,
-            font=theme.font(12, "bold"),
-            **kwargs,
+        self.setText(f"  {text}  ")
+        self.setFont(theme.font(12, "bold"))
+        self.setAlignment(Qt.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.setStyleSheet(
+            f"QLabel {{ color: {foreground}; background: {background}; "
+            f"border-radius: 10px; padding: 4px 8px; }}"
+        )
+        if kwargs.get("width"):
+            self.setFixedWidth(int(kwargs["width"]))
+
+
+class BusyButton(QPushButton):
+    def __init__(self, master: QWidget | None = None, text: str = "Button", **kwargs):
+        command = kwargs.pop("command", None)
+        background = kwargs.pop("fg_color", kwargs.pop("background", theme.CARD_BG))
+        hover = kwargs.pop("hover_color", kwargs.pop("hover", None))
+        color = kwargs.pop("text_color", kwargs.pop("color", theme.TEXT))
+        radius = kwargs.pop("corner_radius", 8)
+        border = kwargs.pop("border_color", None)
+        border_width = kwargs.pop("border_width", 0)
+        width = kwargs.pop("width", None)
+        height = kwargs.pop("height", None)
+        state = kwargs.pop("state", None)
+        super().__init__(master)
+        self._rest_text = text
+        self.setText(text)
+        if command is not None:
+            self.clicked.connect(command)
+        if width:
+            self.setMinimumWidth(int(width))
+        if height:
+            self.setFixedHeight(int(height))
+        if state in ("disabled", False):
+            self.setEnabled(False)
+        self.setFont(kwargs.pop("font", theme.font(13)))
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(
+            theme.button_style(
+                background, hover, color, int(radius), border, int(border_width)
+            )
         )
 
-
-class BusyButton(ctk.CTkButton):
-    """A button that shows busy state (disabled + progress text)."""
-
-    def __init__(self, master, text: str = "Button", **kwargs):
-        self._rest_text = text
-        super().__init__(master, text=text, **kwargs)
-        self._busy = False
-
-    def set_busy(self, busy: bool, running_text: Optional[str] = None) -> None:
+    def set_busy(self, busy: bool, running_text: str | None = None) -> None:
         self._busy = busy
-        if busy:
-            self.configure(state="disabled", text=running_text or "Working…")
-        else:
-            self.configure(state="normal", text=self._rest_text)
+        self.setEnabled(not busy)
+        self.setText((running_text or "Working…") if busy else self._rest_text)
 
     @property
     def busy(self) -> bool:
-        return self._busy
+        return getattr(self, "_busy", False)
 
 
-class Toast(ctk.CTkLabel):
-    """Transient notification that slides under the top-right corner."""
-
-    def __init__(self, master: ctk.CTkBaseClass):
-        super().__init__(
-            master,
-            text="",
-            fg_color=theme.INPUT_BG,
-            corner_radius=8,
-            font=theme.font(13),
+class Toast(QLabel):
+    def __init__(self, master: QWidget):
+        super().__init__(master)
+        self._job: QTimer | None = None
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+        self.setFont(theme.font(13))
+        self.setWordWrap(True)
+        self.setMaximumWidth(360)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            f"QLabel {{ color: {theme.TEXT}; background: {theme.INPUT_BG}; "
+            f"border: 1px solid {theme.BORDER}; border-radius: 8px; "
+            "padding: 10px 14px; }}"
         )
-        self._job: Optional[str] = None
+        self.hide()
 
-    def show(self, message: str, kind: str = "info", ms: int = 2600) -> None:
+    def show(self, message: str = "", kind: str = "info", ms: int = 2600) -> None:
         color = {
             "info": theme.TEXT,
             "ok": theme.SUCCESS,
             "warn": theme.WARNING,
             "error": theme.DANGER,
         }.get(kind, theme.TEXT)
-        self.configure(text=message, text_color=color)
-        self.lift()
-        self.place(relx=1.0, x=-16, y=16, anchor="ne")
-        if self._job:
-            self.after_cancel(self._job)
-        self._job = self.after(ms, self.hide)
+        self.setText(message)
+        self.setStyleSheet(
+            f"QLabel {{ color: {color}; background: {theme.INPUT_BG}; "
+            f"border: 1px solid {theme.BORDER}; border-radius: 8px; "
+            "padding: 10px 14px; }}"
+        )
+        self.adjustSize()
+        self._place()
+        self.raise_()
+        self.setVisible(True)
+        if self._job is not None:
+            self._job.stop()
+        self._hide_timer.start(ms)
+
+    def _place(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.move(max(0, parent.width() - self.width() - 16), 16)
 
     def hide(self) -> None:
-        self.place_forget()
+        self.setVisible(False)
 
 
-class MicLevelMeter(ctk.CTkProgressBar):
-    """Small live-input meter fed by the recorder's level queue."""
+class MicLevelMeter(QProgressBar):
+    def __init__(self, master: QWidget, width: int = 180, **kwargs):
+        super().__init__(master)
+        self.setRange(0, 100)
+        self.setValue(0)
+        self.setTextVisible(False)
+        self.setFixedHeight(10)
+        self.setFixedWidth(int(width))
+        self.setStyleSheet(theme.progress_style())
 
-    def __init__(self, master, width: int = 180, **kwargs):
-        super().__init__(
-            master,
-            width=width,
-            height=10,
-            corner_radius=5,
-            fg_color=theme.INPUT_BG,
-            progress_color=theme.ACCENT,
-            mode="determinate",
-            **kwargs,
-        )
-        self.set(0)
+    def set(self, value: float) -> None:
+        number = float(value)
+        if number <= 1:
+            number *= 100
+        self.setValue(int(max(0, min(100, number))))
 
     def push(self, level: float) -> None:
-        level = max(0.0, min(1.0, level * 14.0))
-        self.set(level)
+        self.set(max(0.0, min(1.0, float(level) * 14.0)) * 100)
 
 
-class AudioPlayerBar(ctk.CTkFrame):
-    """A compact player sharing the application-wide AudioPlayer instance."""
-
-    def __init__(self, master, player, **kwargs):
-        super().__init__(master, fg_color=theme.INPUT_BG, corner_radius=12, **kwargs)
+class AudioPlayerBar(QFrame):
+    def __init__(self, master: QWidget, player, **kwargs):
+        super().__init__(master)
         self.player = player
-        self._file: Optional[Path] = None
-        self._last_playing_state: Optional[str] = None
+        self._file: Path | None = None
         self._seeking = False
+        self.setStyleSheet(theme.frame_style(theme.INPUT_BG, 12))
+        layout = QGridLayout(self)
+        layout.setContentsMargins(10, 6, 16, 6)
+        layout.setHorizontalSpacing(4)
+        layout.setVerticalSpacing(0)
 
-        self._btn_play = ctk.CTkButton(
-            self, text="▶ Play", width=92, height=32,
-            command=self._toggle, fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-            font=theme.font(13, "bold"),
+        self._btn_play = QPushButton("▶ Play", self)
+        self._btn_play.setFixedSize(92, 32)
+        self._btn_play.setFont(theme.font(13, "bold"))
+        self._btn_play.setStyleSheet(
+            theme.button_style(theme.ACCENT, theme.ACCENT_HOVER, theme.ON_ACCENT, 8)
         )
-        self._btn_play.grid(row=0, column=0, padx=(10, 4), pady=6)
+        self._btn_play.clicked.connect(self._toggle)
+        layout.addWidget(self._btn_play, 0, 0)
 
-        self._btn_stop = ctk.CTkButton(
-            self, text="⏹ Stop", width=72, height=32,
-            command=self._stop, font=theme.font(13),
-            fg_color=theme.INPUT_BG, border_width=1, border_color=theme.BORDER,
+        self._btn_stop = QPushButton("⏹ Stop", self)
+        self._btn_stop.setFixedSize(72, 32)
+        self._btn_stop.setFont(theme.font(13))
+        self._btn_stop.setStyleSheet(
+            theme.button_style(
+                theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 8, theme.BORDER, 1
+            )
         )
-        self._btn_stop.grid(row=0, column=1, padx=4, pady=6)
+        self._btn_stop.clicked.connect(self._stop)
+        layout.addWidget(self._btn_stop, 0, 1)
 
-        self._lbl_time = ctk.CTkLabel(self, text="00:00 / 00:00", font=theme.font(12), text_color=theme.SUBTEXT)
-        self._lbl_time.grid(row=0, column=2, padx=10)
+        self._lbl_time = QLabel("00:00 / 00:00", self)
+        self._lbl_time.setFont(theme.font(12))
+        self._lbl_time.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        layout.addWidget(self._lbl_time, 0, 2)
 
-        self._slider = ctk.CTkSlider(self, from_=0, to=100, number_of_steps=100, height=14)
-        self._slider.set(0)
-        self._slider.configure(command=self._on_slider)
-        self._slider.grid(row=0, column=3, sticky="ew", padx=(4, 16), pady=6)
-        self.grid_columnconfigure(3, weight=1)
+        self._slider = QSlider(Qt.Horizontal, self)
+        self._slider.setRange(0, 100)
+        self._slider.setValue(0)
+        self._slider.setFixedHeight(16)
+        self._slider.valueChanged.connect(self._on_slider)
+        layout.addWidget(self._slider, 0, 3)
+        layout.setColumnStretch(3, 1)
 
-        self._poll()
+        self._timer = QTimer(self)
+        self._timer.setInterval(200)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start()
 
-    # ------------------------------------------------------------ public
+    @staticmethod
+    def _value(obj, name: str, default=0):
+        value = getattr(obj, name, default)
+        return value() if callable(value) else value
+
     def set_file(self, path: str | Path, autoplay: bool = True) -> None:
-        p = Path(path)
-        try:
-            self.player.load(p)
-        except Exception as exc:
-            raise exc
-        self._file = p
-        self._lbl_time.configure(text=f"00:00 / {fmt_clock(self.player.duration)}")
-        self._slider.set(0)
+        selected = Path(path)
+        self.player.load(selected)
+        self._file = selected
+        self._lbl_time.setText(
+            f"00:00 / {fmt_clock(self._value(self.player, 'duration'))}"
+        )
+        self._slider.setValue(0)
         if autoplay:
             self.player.play()
 
     def clear(self) -> None:
-        if self.player.path == self._file:
+        if self._file is not None and self._same_path(
+            self._value(self.player, "path"), self._file
+        ):
             self.player.stop()
         self._file = None
-        self._lbl_time.configure(text="00:00 / 00:00")
-        self._slider.set(0)
+        self._lbl_time.setText("00:00 / 00:00")
+        self._slider.setValue(0)
+        self._btn_play.setText("▶ Play")
 
-    # ------------------------------------------------------------ actions
+    @staticmethod
+    def _same_path(left, right) -> bool:
+        if left is None or right is None:
+            return False
+        try:
+            return Path(left).resolve() == Path(right).resolve()
+        except Exception:
+            return str(left) == str(right)
+
     def _toggle(self) -> None:
-        if self.player.path != self._file or self._file is None:
+        if self._file is None or not self._same_path(
+            self._value(self.player, "path"), self._file
+        ):
             return
-        if self.player.state == self.player.PLAYING:
+        state = self._value(self.player, "state", "")
+        if state == self.player.PLAYING:
             self.player.pause()
         else:
             self.player.play()
 
     def _stop(self) -> None:
-        if self.player.path == self._file:
+        if self._file is not None and self._same_path(
+            self._value(self.player, "path"), self._file
+        ):
             self.player.stop()
 
-    def _on_slider(self, value) -> None:
-        if self.player.path == self._file:
-            self.player.seek_to(float(value) / 100.0 * self.player.duration)
+    def _on_slider(self, value: int) -> None:
+        if self._seeking:
+            return
+        duration = float(self._value(self.player, "duration", 0.0))
+        if self._file is not None and duration > 0:
+            self.player.seek_to(float(value) / 100.0 * duration)
 
-    # ------------------------------------------------------------ polling
     def _poll(self) -> None:
         try:
-            active = self.player.path == self._file and self._file is not None
+            active = self._file is not None and self._same_path(
+                self._value(self.player, "path"), self._file
+            )
             ended = False
             if active:
-                self.player.pump()
-                ended = self.player.state == self.player.IDLE and self.player.duration > 0
-                pos = self.player.position()
-                self._lbl_time.configure(
-                    text=f"{fmt_clock(pos)} / {fmt_clock(self.player.duration)}"
-                )
-                if not self._seeking and self.player.duration > 0:
-                    frac = pos / self.player.duration * 100.0
-                    if abs(self._slider.get() - frac) > 1.0:
-                        self._slider.set(min(100.0, frac))
-                if self.player.state == self.player.PLAYING:
-                    self._btn_play.configure(text="⏸ Pause")
-                elif self.player.state == self.player.PAUSED:
-                    self._btn_play.configure(text="▶ Play")
-                elif ended:
-                    self._btn_play.configure(text="▶ Play")
+                pump = getattr(self.player, "pump", None)
+                if callable(pump):
+                    ended = bool(pump())
+                state = self._value(self.player, "state", "")
+                duration = float(self._value(self.player, "duration", 0.0))
+                position = float(self._value(self.player, "position", 0.0))
+                self._lbl_time.setText(f"{fmt_clock(position)} / {fmt_clock(duration)}")
+                if not self._seeking and duration > 0:
+                    fraction = min(100.0, max(0.0, position / duration * 100.0))
+                    if abs(self._slider.value() - fraction) > 1.0:
+                        self._seeking = True
+                        self._slider.setValue(int(fraction))
+                        self._seeking = False
+                if state == self.player.PLAYING:
+                    self._btn_play.setText("⏸ Pause")
+                elif state == self.player.PAUSED or ended:
+                    self._btn_play.setText("▶ Play")
             else:
                 if self._file is not None:
-                    self._lbl_time.configure(text="00:00 / 00:00")
-                    self._slider.set(0)
+                    self._lbl_time.setText("00:00 / 00:00")
+                    self._slider.setValue(0)
                     self._file = None
-                self._btn_play.configure(text="▶ Play")
+                self._btn_play.setText("▶ Play")
         except Exception:
             pass
-        self.after(200, self._poll)
 
 
-class Screen(ctk.CTkFrame):
-    """Base class for all sidebar screens."""
-
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
+class Screen(QWidget):
+    def __init__(self, master: QWidget, app):
+        super().__init__(master)
         self.app = app
         self._status_holder = None
+        self.setStyleSheet("QWidget { background: transparent; }")
 
     def on_show(self, **kwargs) -> None:
-        """Hook called every time the screen becomes visible."""
+        return None
 
     def on_hide(self) -> None:
-        """Hook called when the screen leaves focus (used to stop loops)."""
+        return None
 
-    def set_status(self, label_widget, text: str, color: str = theme.SUBTEXT) -> None:
-        if label_widget is not None:
-            label_widget.configure(text=text, text_color=color)
+    def set_status(
+        self, label_widget: QWidget | None, text: str, color: str = theme.SUBTEXT
+    ) -> None:
+        if label_widget is not None and hasattr(label_widget, "setText"):
+            label_widget.setText(text)
+            if hasattr(label_widget, "setStyleSheet"):
+                label_widget.setStyleSheet(theme.label_style(color))
 
     def toast(self, message: str, kind: str = "info") -> None:
         self.app.toast(message, kind)
 
-    def run_between(self, future: Future, on_success: Callable, on_error: Callable) -> None:
+    def run_between(
+        self, future: Future, on_success: Callable, on_error: Callable
+    ) -> None:
         bind_future(self, future, on_success, on_error)
+
+    def after(self, milliseconds: int, callback: Callable) -> QTimer:
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(callback)
+        timer.start(int(milliseconds))
+        return timer
+
+    @staticmethod
+    def after_cancel(timer: QTimer | None) -> None:
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()

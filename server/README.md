@@ -1,0 +1,157 @@
+# Django License Server
+
+This directory is a self-contained Django REST Framework license server. It does not import or modify the desktop application in the parent project.
+
+## Features
+
+- HMAC-SHA-256 hashing of normalized license keys with `LICENSE_HMAC_PEPPER`.
+- One-time device binding enforced with a database uniqueness constraint and a transaction.
+- Ed25519-signed lease responses using canonical JSON and an explicit signing `key_id`.
+- Configurable lease duration and grace period.
+- Database-backed nonce replay protection and idempotency records.
+- Scoped IP throttling for activation, status, and health requests.
+- Generic public error envelopes that do not distinguish unknown, revoked, or expired keys.
+- Django admin-only license creation and revocation.
+- SQLite by default, with environment overrides for other Django database backends.
+- Audit records for activation, validation, binding failures, expiry, and administrative revocation.
+
+## Setup
+
+Run commands from this directory:
+
+```text
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+copy .env.example .env
+python manage.py migrate
+python manage.py createsuperuser
+python manage.py runserver 127.0.0.1:8000
+```
+
+The development defaults use SQLite and an ephemeral signing key. Set `DJANGO_DEBUG=0`, a strong `DJANGO_SECRET_KEY`, a strong `LICENSE_HMAC_PEPPER`, and persistent `LICENSE_SIGNING_KEYS` before deploying; production startup rejects missing values. Values in `server/.env` are loaded automatically when present; process environment variables take precedence. Use your process manager or deployment secret store in production.
+
+Generate an Ed25519 private key for a deployment with:
+
+```text
+python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; from cryptography.hazmat.primitives import serialization; import base64; key=Ed25519PrivateKey.generate(); print(base64.urlsafe_b64encode(key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())).decode().rstrip('='))"
+```
+
+Store the value in `LICENSE_SIGNING_KEYS` as a JSON object. Keep old keys during rotation and switch `LICENSE_SIGNING_KEY_ID` only after clients have the new public key.
+
+## API
+
+All public client endpoints accept JSON. `nonce` and `idempotency_key` may be supplied in the body or as `X-Nonce` and `X-Idempotency-Key` headers. A nonce and idempotency key are required for every activation and status request. Retrying the same idempotency key with the same semantic request returns the original response; changing the request with that key returns `409`.
+
+Successful lease responses use this compact JSON envelope:
+
+```json
+{
+  "algorithm": "Ed25519",
+  "encoding": "canonical-json",
+  "key_id": "current-v1",
+  "payload": {
+    "activation_id": "...",
+    "client_metadata": {},
+    "device_binding": "sha256-derived-device-binding",
+    "entitlements": {},
+    "expires_at": "2026-01-01T00:00:00Z",
+    "grace_expires_at": "2026-01-01T00:05:00Z",
+    "grace_duration_seconds": 300,
+    "issued_at": "2026-01-01T00:00:00Z",
+    "lease_duration_seconds": 3600,
+    "lease_id": "...",
+    "license_key_id": "...",
+    "server_time": "2026-01-01T00:00:00Z",
+    "state": "active",
+    "type": "license_lease",
+    "valid": true,
+    "version": 1
+  },
+  "signature": "base64url-ed25519-signature"
+}
+```
+
+The signature is over the UTF-8 bytes of `canonical_json(payload)`, where keys are sorted and separators are compact. Verify the `key_id` against a trusted public-key map before accepting `valid: true`.
+
+### Activate
+
+`POST /api/v1/licenses/activate/`
+
+```json
+{
+  "license_key": "LIC-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX",
+  "device_id": "stable-device-identifier",
+  "nonce": "random-unique-value",
+  "idempotency_key": "random-unique-value",
+  "metadata": {"product": "desktop"}
+}
+```
+
+The first successful request creates the device activation and an active lease. The same device can request a new lease, but another device receives a generic binding error.
+
+### Validate
+
+`POST /api/v1/licenses/status/`
+
+`POST /api/v1/licenses/validate/` is an alias.
+
+```json
+{
+  "license_key": "LIC-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX",
+  "device_id": "stable-device-identifier",
+  "nonce": "another-random-unique-value",
+  "idempotency_key": "another-random-unique-value"
+}
+```
+
+An unexpired lease is returned as `state: "active"`; a successful status check issues a fresh lease. During the configured grace period, the original lease is returned as `state: "grace"` without renewal. After grace, the request receives a generic `invalid_license` error.
+
+### Health
+
+`GET /health/` or `GET /api/v1/health/` checks database connectivity and returns a non-sensitive service status.
+
+## Administration
+
+Create a staff user with `python manage.py createsuperuser`, then open `/admin/`. License keys are generated by the admin form when the raw-key field is blank. A custom key must be at least 20 characters and mix at least two of letters, digits, and symbols. The raw key is displayed once after creation and is never stored. Only the Django admin can create or revoke keys; revocation is an admin action and is audited.
+
+Request, nonce, and idempotency fingerprints are stored as keyed HMACs, so the
+database never retains a raw-key-derived offline dictionary check.
+
+## Configuration
+
+Important environment variables are listed in `.env.example`:
+
+- `LICENSE_HMAC_PEPPER`: mandatory outside debug mode, at least 32 characters, and
+  rejected when it still contains the example placeholder; changing it invalidates
+  all existing key hashes.
+- `DJANGO_SECRET_KEY`: mandatory outside debug mode and at least 50 characters.
+- `LICENSE_SIGNING_KEYS`: JSON key-id-to-private-key map used for rotation.
+- `LICENSE_SIGNING_KEY_ID`: active signing key id included in every lease envelope.
+- `LICENSE_LEASE_DURATION_SECONDS`: active lease lifetime.
+- `LICENSE_LEASE_GRACE_SECONDS`: post-expiration validation grace.
+- `LICENSE_NONCE_TTL_SECONDS`: replay-record retention.
+- `LICENSE_IDEMPOTENCY_TTL_SECONDS`: idempotency-record retention.
+- `LICENSE_LEASE_RETENTION_COUNT`: number of recent leases retained per activation;
+  values below 1 are rejected and fail the request closed.
+- `LICENSE_NONCE_TTL_SECONDS`, `LICENSE_IDEMPOTENCY_TTL_SECONDS`: replay and
+  idempotency windows; values below 1 are rejected and fail the request closed.
+- `LICENSE_RATE_LIMIT_*`: DRF throttle rates.
+- `LICENSE_CACHE_BACKEND`, `LICENSE_CACHE_LOCATION`: cache used for throttling;
+  use a shared backend such as `django.core.cache.backends.redis.RedisCache`
+  in multi-process production deployments.
+- `LICENSE_TRUST_PROXY_HEADERS`: enable only when a single trusted reverse proxy
+  sets `X-Forwarded-For`; misconfiguration lets clients spoof throttle identity.
+- `DATABASE_ENGINE`, `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_HOST`, `DATABASE_PORT`, or `DATABASE_URL`: database overrides.
+- `DJANGO_SECURE_SSL_REDIRECT`, cookie-security, HSTS, and trusted-proxy settings: transport and browser security controls.
+
+## Tests
+
+With dependencies installed, run only the server tests:
+
+```text
+python manage.py test licenses
+python manage.py check
+```
+
+The scaffold targets Django 5.x, Django REST Framework 3.15+, Python 3.11+, and `cryptography` 42+. SQLite is convenient for development and tests; use a transactional database such as PostgreSQL for multi-process production deployments and configure a shared cache if throttling is moved beyond the default local-memory cache.

@@ -1,0 +1,35 @@
+{
+  "type": "model_catalog",
+  "version": 1,
+  "generated_at": "",
+  "models": [
+    {
+      "id": "vosk-small-en-us-0.15",
+      "kind": "stt",
+      "name": "Vosk English (US) small",
+      "version": "0.15",
+      "description": "Offline speech recognition for US English. About 40 MB.",
+      "engine": "vosk",
+      "languages": ["en-US"],
+      "requires": ["vosk"],
+      "install_dir": "vosk-models/small_en-us",
+      "marker_files": ["am", "graph"],
+      "size_bytes": 40000000,
+      "archive": {
+        "format": "zip",
+        "sha256": "REPLACE_WITH_SHA256_OF_THE_ARCHIVE",
+        "strip_single_root": true,
+        "max_extracted_bytes": 268435456
+      },
+      "assets": [
+        {
+          "name": "vosk-small-en-us-0.15.zip",
+          "url": "https://github.com/OWNER/REPO/releases/download/models-2026-01/vosk-small-en-us-0.15.zip",
+          "size_bytes": 40000000,
+          "sha256": "REPLACE_WITH_SHA256_OF_THE_ASSET",
+          "part": 0
+        }
+      ]
+    }
+  ]
+}

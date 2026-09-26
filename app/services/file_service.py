@@ -9,8 +9,10 @@ from app import config
 
 def ensure_dirs() -> None:
     """Create every folder the application needs at startup."""
-    config.BASE_DIR.mkdir(parents=True, exist_ok=True)
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    config.DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    for path in config.MODEL_SUBDIRS.values():
+        path.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in config.OUTPUT_SUBDIRS.values():
         path.mkdir(parents=True, exist_ok=True)

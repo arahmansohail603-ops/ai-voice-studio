@@ -1,5 +1,10 @@
-customtkinter>=5.2.2
-edge-tts>=6.1.12
+# AI Voice Studio — core dependencies.
+# The audio engines run locally; commercial licensing and activation are handled
+# by the desktop app and its configured license server.
+
+PyQt5>=5.15,<5.16
+cryptography>=42
+keyring>=25
 pyttsx3>=2.90
 SpeechRecognition>=3.10.1
 sounddevice>=0.4.6
@@ -8,3 +13,13 @@ pydub>=0.25.1
 numpy>=1.26.0
 pygame>=2.5.2; python_version < '3.13'
 pygame-ce>=2.5.2; python_version >= '3.13'
+
+# Default text-to-speech backend is Qwen3-TTS (local, fully offline). The
+# Qwen3-TTS model + torch live in requirements-clone.txt; without it the app
+# falls back to the offline system voices. No Microsoft/cloud services are used.
+
+# The fully-offline engines (Vosk speech-to-text, Argos translation, Whisper
+# multi-language speech-to-text, optional Piper neural voices) live in
+# requirements-local.txt so they can be installed or skipped independently.
+# The app works without them and tells you what to install when a feature
+# needs one.

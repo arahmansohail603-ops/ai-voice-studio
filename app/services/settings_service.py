@@ -27,7 +27,7 @@ class SettingsService:
         self._path = config.settings_path()
 
     # -- lifecycle -----------------------------------------------------------
-    def load(self) -> "SettingsService":
+    def load(self) -> SettingsService:
         with self._lock:
             if self._path.exists():
                 try:

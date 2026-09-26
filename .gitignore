@@ -12,6 +12,19 @@ env/
 data/
 output/
 
+# Downloaded AI model weights (multi-GB, fetched at runtime from the catalog)
+models/
+*.part
+*.tmp
+
+# Build output and generated trust configuration
+dist/
+dist-*/
+app/_build_license_config.py
+
+# Local development trust configuration for the desktop launcher
+scripts/license-dev.env
+
 # IDE / OS
 .vscode/
 .idea/

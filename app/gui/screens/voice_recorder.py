@@ -1,9 +1,18 @@
-"""Voice Recorder screen: record, pause, playback, save voice note, timer."""
 from __future__ import annotations
 
 from pathlib import Path
 
-import customtkinter as ctk
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from app.core import audio_utils
 from app.core.errors import DeviceError
@@ -15,104 +24,156 @@ from app.services import file_service
 class VoiceRecorderScreen(Screen):
     def __init__(self, master, app):
         super().__init__(master, app)
-        self.grid_columnconfigure(0, weight=1)
-
         self._tracking = False
-        self._track_job = None
         self._draft: Path | None = None
         self._recorded_seconds = 0.0
+        self._track_timer = QTimer(self)
+        self._track_timer.setInterval(100)
+        self._track_timer.timeout.connect(self._tick)
 
-        # ----------------------------------------------------------- mic-only
-        panel = ctk.CTkFrame(self, fg_color=theme.PANEL_BG, corner_radius=12)
-        panel.grid(row=0, column=0, sticky="ew")
-        panel.grid_columnconfigure(4, weight=1)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self.mic_status = ctk.CTkLabel(
-            panel, text="Checking microphone…", font=theme.font(13),
-            text_color=theme.SUBTEXT, anchor="w",
-        )
-        self.mic_status.grid(row=0, column=0, columnspan=5, sticky="ew", padx=16, pady=(12, 2))
+        panel = QFrame(self)
+        panel.setStyleSheet(theme.frame_style(theme.PANEL_BG, 12))
+        panel_layout = QGridLayout(panel)
+        panel_layout.setContentsMargins(16, 12, 16, 12)
+        panel_layout.setHorizontalSpacing(8)
+        panel_layout.setVerticalSpacing(4)
+        panel_layout.setColumnStretch(4, 1)
 
-        self.timer_lbl = ctk.CTkLabel(
-            panel, text="00:00.0", font=theme.font(40, "bold"), text_color=theme.TEXT,
-        )
-        self.timer_lbl.grid(row=1, column=0, padx=(16, 12), pady=(6, 6))
+        self.mic_status = QLabel("Checking microphone…", panel)
+        self.mic_status.setFont(theme.font(13))
+        self.mic_status.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        panel_layout.addWidget(self.mic_status, 0, 0, 1, 5)
+
+        self.timer_lbl = QLabel("00:00.0", panel)
+        self.timer_lbl.setFont(theme.font(40, "bold"))
+        self.timer_lbl.setStyleSheet(theme.label_style(theme.TEXT))
+        panel_layout.addWidget(self.timer_lbl, 1, 0)
 
         self.meter = MicLevelMeter(panel, width=220)
-        self.meter.grid(row=1, column=1, padx=8, pady=6)
-        ctk.CTkLabel(
-            panel, text="input level", font=theme.font(11), text_color=theme.SUBTEXT,
-        ).grid(row=2, column=1, padx=8, pady=(0, 10))
+        panel_layout.addWidget(self.meter, 1, 1)
+        level_label = QLabel("input level", panel)
+        level_label.setFont(theme.font(11))
+        level_label.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        panel_layout.addWidget(level_label, 2, 1)
 
-        btn_row = ctk.CTkFrame(panel, fg_color="transparent")
-        btn_row.grid(row=1, column=2, columnspan=3, rowspan=2, sticky="e", padx=16)
-
+        button_row = QFrame(panel)
+        button_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        button_layout = QHBoxLayout(button_row)
+        button_layout.setContentsMargins(0, 0, 0, 0)
         self.record_btn = BusyButton(
-            btn_row, text="● Record", command=self._record, width=110, height=38,
-            font=theme.font(14, "bold"), fg_color=theme.ACCENT,
+            button_row,
+            text="● Record",
+            command=self._record,
+            width=110,
+            height=38,
+            font=theme.font(14, "bold"),
+            fg_color=theme.ACCENT,
             hover_color=theme.ACCENT_HOVER,
+            text_color=theme.ON_ACCENT,
         )
-        self.record_btn.pack(side="left", padx=4)
-
-        self.pause_btn = ctk.CTkButton(
-            btn_row, text="⏸ Pause", command=self._pause, width=96, height=38,
-            font=theme.font(13), state="disabled",
-            fg_color=theme.INPUT_BG, border_width=1, border_color=theme.BORDER,
+        button_layout.addWidget(self.record_btn)
+        self.pause_btn = QPushButton("⏸ Pause", button_row)
+        self.pause_btn.setFixedSize(96, 38)
+        self.pause_btn.setFont(theme.font(13))
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setStyleSheet(
+            theme.button_style(
+                theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 8, theme.BORDER, 1
+            )
         )
-        self.pause_btn.pack(side="left", padx=4)
-
-        self.stop_btn = ctk.CTkButton(
-            btn_row, text="⏹ Stop", command=self._stop, width=88, height=38,
-            font=theme.font(13, "bold"), state="disabled",
-            fg_color=theme.DANGER, hover_color="#c94343",
+        self.pause_btn.clicked.connect(self._pause)
+        button_layout.addWidget(self.pause_btn)
+        self.stop_btn = QPushButton("⏹ Stop", button_row)
+        self.stop_btn.setFixedSize(88, 38)
+        self.stop_btn.setFont(theme.font(13, "bold"))
+        self.stop_btn.setStyleSheet(
+            theme.button_style(theme.DANGER, "#c94343", theme.TEXT, 8)
         )
-        self.stop_btn.pack(side="left", padx=4)
+        self.stop_btn.clicked.connect(self._stop)
+        self.stop_btn.setEnabled(False)
+        button_layout.addWidget(self.stop_btn)
+        button_layout.addStretch(1)
+        panel_layout.addWidget(button_row, 1, 2, 1, 3)
+        root.addWidget(panel)
+        root.addSpacing(14)
 
-        # -------------------------------------------------------- playback row
-        play_panel = ctk.CTkFrame(self, fg_color=theme.PANEL_BG, corner_radius=12)
-        play_panel.grid(row=1, column=0, sticky="ew", pady=(14, 0))
-        play_panel.grid_columnconfigure(0, weight=1)
-
+        play_panel = QFrame(self)
+        play_panel.setStyleSheet(theme.frame_style(theme.PANEL_BG, 12))
+        play_layout = QVBoxLayout(play_panel)
+        play_layout.setContentsMargins(14, 10, 14, 12)
+        play_layout.setSpacing(8)
         if app.player is not None:
             self.player_bar = AudioPlayerBar(play_panel, app.player)
-            self.player_bar.grid(row=0, column=0, sticky="ew", padx=14, pady=10)
+            play_layout.addWidget(self.player_bar)
         else:
             self.player_bar = None
+            unavailable = QLabel(
+                "Playback unavailable (no audio output device). "
+                "Audio files are still saved on disk.",
+                play_panel,
+            )
+            unavailable.setWordWrap(True)
+            unavailable.setFont(theme.font(13))
+            unavailable.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+            play_layout.addWidget(unavailable)
 
-        save_row = ctk.CTkFrame(play_panel, fg_color="transparent")
-        save_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
-        ctk.CTkLabel(save_row, text="Name:", font=theme.font(13),
-                     text_color=theme.SUBTEXT).pack(side="left")
-        self.name_entry = ctk.CTkEntry(
-            save_row, width=280, placeholder_text="voice note name",
-            fg_color=theme.INPUT_BG, border_color=theme.BORDER, font=theme.font(13),
-        )
-        self.name_entry.pack(side="left", padx=(8, 12))
-        ctk.CTkLabel(save_row, text="Format:", font=theme.font(13),
-                     text_color=theme.SUBTEXT).pack(side="left")
-        self.format_menu = ctk.CTkOptionMenu(
-            save_row, values=["wav", "mp3"], width=80, dynamic_resizing=False,
-            font=theme.font(13), fg_color=theme.INPUT_BG, button_color=theme.ACCENT,
-        )
-        self.format_menu.pack(side="left", padx=(8, 12))
+        save_row = QFrame(play_panel)
+        save_row.setStyleSheet("QFrame { background: transparent; border: none; }")
+        save_layout = QHBoxLayout(save_row)
+        save_layout.setContentsMargins(0, 0, 0, 0)
+        name_label = QLabel("Name:", save_row)
+        name_label.setFont(theme.font(13))
+        name_label.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        save_layout.addWidget(name_label)
+        self.name_entry = QLineEdit(save_row)
+        self.name_entry.setFixedWidth(280)
+        self.name_entry.setPlaceholderText("voice note name")
+        self.name_entry.setStyleSheet(theme.input_style())
+        save_layout.addWidget(self.name_entry)
+        format_label = QLabel("Format:", save_row)
+        format_label.setFont(theme.font(13))
+        format_label.setStyleSheet(theme.label_style(theme.SUBTEXT))
+        save_layout.addWidget(format_label)
+        self.format_menu = QComboBox(save_row)
+        self.format_menu.addItems(["wav", "mp3"])
+        self.format_menu.setFixedWidth(80)
+        self.format_menu.setFont(theme.font(13))
+        self.format_menu.setStyleSheet(theme.combo_style())
+        save_layout.addWidget(self.format_menu)
         self.save_btn = BusyButton(
-            save_row, text="Save Voice Note", command=self._save_note,
-            width=140, height=34, font=theme.font(13, "bold"),
-            fg_color=theme.INPUT_BG, border_width=1, border_color=theme.BORDER,
+            save_row,
+            text="Save Voice Note",
+            command=self._save_note,
+            width=140,
+            height=34,
+            font=theme.font(13, "bold"),
+            fg_color=theme.INPUT_BG,
+            hover_color=theme.CARD_BG,
+            border_color=theme.BORDER,
+            border_width=1,
         )
-        self.save_btn.pack(side="left")
+        save_layout.addWidget(self.save_btn)
         if not audio_utils.ffmpeg_available():
-            ctk.CTkLabel(
-                save_row, text="ffmpeg not found — MP3 disabled.",
-                font=theme.font(11), text_color=theme.WARNING,
-            ).pack(side="left", padx=10)
+            warning = QLabel("ffmpeg not found — MP3 disabled.", save_row)
+            warning.setFont(theme.font(11))
+            warning.setStyleSheet(theme.label_style(theme.WARNING))
+            save_layout.addWidget(warning)
+        save_layout.addStretch(1)
+        play_layout.addWidget(save_row)
+        play_layout.addStretch(1)
+        root.addWidget(play_panel, 1)
 
-        self.status_lbl = ctk.CTkLabel(
-            self, text="", font=theme.font(12), text_color=theme.SUBTEXT, anchor="w",
-        )
-        self.status_lbl.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.status_lbl = QLabel("", self)
+        self.status_lbl.setFont(theme.font(12))
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        root.addWidget(self.status_lbl)
+        root.addSpacing(10)
 
-    # ------------------------------------------------------------ lifecycle
     def on_show(self, **kwargs) -> None:
         self._update_mic_status()
         if not self._tracking:
@@ -120,94 +181,93 @@ class VoiceRecorderScreen(Screen):
 
     def on_hide(self) -> None:
         self._tracking = False
-        if self._track_job:
-            self.after_cancel(self._track_job)
-            self._track_job = None
+        self._track_timer.stop()
 
     def _update_mic_status(self) -> None:
         try:
             self.app.recorder.check_microphone(raise_error=True)
-            self.mic_status.configure(
-                text="Microphone ready — click Record to start.",
-                text_color=theme.SUCCESS,
-            )
+            self.mic_status.setText("Microphone ready — click Record to start.")
+            self.mic_status.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         except DeviceError as exc:
-            self.mic_status.configure(text=str(exc), text_color=theme.DANGER)
+            self.mic_status.setText(str(exc))
+            self.mic_status.setStyleSheet(theme.label_style(theme.DANGER, "left"))
 
-    # ------------------------------------------------------------- tracking
     def _start_tracking(self) -> None:
         self._tracking = True
+        self._track_timer.start()
         self._tick()
 
     def _tick(self) -> None:
         if not self._tracking:
             return
-        rec = self.app.recorder
-        elapsed = rec.elapsed()
+        recorder = self.app.recorder
+        elapsed = recorder.elapsed()
         tenths = int(elapsed * 10)
-        self.timer_lbl.configure(
-            text=f"{tenths // 600:02d}:{(tenths // 10) % 60:02d}.{tenths % 10}"
+        self.timer_lbl.setText(
+            f"{tenths // 600:02d}:{(tenths // 10) % 60:02d}.{tenths % 10}"
         )
         try:
-            level = rec.level_queue.get_nowait()
-            self.meter.push(level)
+            self.meter.push(recorder.level_queue.get_nowait())
         except Exception:
             pass
-        self._track_job = self.after(100, self._tick)
 
-    # ------------------------------------------------------------- actions
     def _record(self) -> None:
         if self.app.recorder.is_recording:
             return
         try:
             self.app.recorder.start()
         except DeviceError as exc:
-            self.mic_status.configure(text=str(exc), text_color=theme.DANGER)
+            self.mic_status.setText(str(exc))
+            self.mic_status.setStyleSheet(theme.label_style(theme.DANGER, "left"))
             self.toast("Could not start recording.", "error")
             return
         self._draft = None
         self.record_btn.set_busy(True, "● Recording…")
-        self.pause_btn.configure(state="normal", text="⏸ Pause")
-        self.stop_btn.configure(state="normal")
-        self.status_lbl.configure(text="Recording…", text_color=theme.SUCCESS)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("⏸ Pause")
+        self.stop_btn.setEnabled(True)
+        self.status_lbl.setText("Recording…")
+        self.status_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
 
     def _pause(self) -> None:
-        rec = self.app.recorder
-        if rec.is_paused:
-            rec.resume()
-            self.pause_btn.configure(text="⏸ Pause")
-            self.status_lbl.configure(text="Recording…", text_color=theme.SUCCESS)
+        recorder = self.app.recorder
+        if recorder.is_paused:
+            recorder.resume()
+            self.pause_btn.setText("⏸ Pause")
+            self.status_lbl.setText("Recording…")
+            self.status_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         else:
-            rec.pause()
-            self.pause_btn.configure(text="▶ Resume")
-            self.status_lbl.configure(text="Paused.", text_color=theme.WARNING)
+            recorder.pause()
+            self.pause_btn.setText("▶ Resume")
+            self.status_lbl.setText("Paused.")
+            self.status_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
 
     def _stop(self) -> None:
-        rec = self.app.recorder
-        if not rec.is_recording and rec.capture is None:
+        recorder = self.app.recorder
+        if not recorder.is_recording and recorder.capture is None:
             self.toast("Nothing to stop.", "warn")
             return
-        self._recorded_seconds = rec.elapsed()
-        rec.stop()
+        self._recorded_seconds = recorder.elapsed()
+        recorder.stop()
         self.record_btn.set_busy(False)
-        self.pause_btn.configure(state="disabled", text="⏸ Pause")
-        self.stop_btn.configure(state="disabled")
-
-        if rec.capture is None or rec.capture.size == 0:
-            self.status_lbl.configure(text="No audio captured.", text_color=theme.WARNING)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸ Pause")
+        self.stop_btn.setEnabled(False)
+        if recorder.capture is None or recorder.capture.size == 0:
+            self.status_lbl.setText("No audio captured.")
+            self.status_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
             return
-
         self._draft = file_service.unique_path(
             file_service.category_dir("recordings"),
             file_service.timestamp_stem("recording_draft"),
             "wav",
         )
         try:
-            rec.save(self._draft, "wav")
-            self.status_lbl.configure(
-                text=f"Captured {self._recorded_seconds:.1f}s — playback ready.",
-                text_color=theme.SUCCESS,
+            recorder.save(self._draft, "wav")
+            self.status_lbl.setText(
+                f"Captured {self._recorded_seconds:.1f}s — playback ready."
             )
+            self.status_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
             self.toast("Recording captured.", "ok")
             if self.player_bar is not None:
                 try:
@@ -215,39 +275,43 @@ class VoiceRecorderScreen(Screen):
                 except Exception:
                     pass
         except Exception as exc:
-            self.status_lbl.configure(text=str(exc), text_color=theme.DANGER)
+            self.status_lbl.setText(str(exc))
+            self.status_lbl.setStyleSheet(theme.label_style(theme.DANGER, "left"))
 
     def _save_note(self) -> None:
         if self._draft is None or not self._draft.exists():
             self.toast("Record something first.", "warn")
             return
-        name = (self.name_entry.get() or "").strip().replace(" ", "_") or "voice_note"
-        fmt = self.format_menu.get()
-        if fmt == "mp3" and not audio_utils.ffmpeg_available():
+        name = self.name_entry.text().strip().replace(" ", "_") or "voice_note"
+        output_format = self.format_menu.currentText()
+        if output_format == "mp3" and not audio_utils.ffmpeg_available():
             self.toast("MP3 needs ffmpeg — using WAV.", "warn")
-            fmt = "wav"
-
-        dest = file_service.unique_path(
+            output_format = "wav"
+        destination = file_service.unique_path(
             file_service.category_dir("recordings"),
             file_service.timestamp_stem(name),
-            fmt,
+            output_format,
         )
         self.save_btn.set_busy(True, "Saving…")
         try:
-            if dest.suffix == self._draft.suffix:
-                dest.write_bytes(self._draft.read_bytes())
+            if destination.suffix == self._draft.suffix:
+                destination.write_bytes(self._draft.read_bytes())
                 self._draft.unlink(missing_ok=True)
             else:
-                audio_utils.convert_format(self._draft, dest)
+                audio_utils.convert_format(self._draft, destination)
                 self._draft.unlink(missing_ok=True)
             self._draft = None
             self.app.history.create(
-                type_="note", method="record", title=name,
+                type_="note",
+                method="record",
+                title=name,
                 text="Voice note recorded in-app.",
-                file=str(dest), duration=self._recorded_seconds,
+                file=str(destination),
+                duration=self._recorded_seconds,
             )
-            self.toast(f"Voice note saved: {dest.name}", "ok")
-            self.status_lbl.configure(text=str(dest), text_color=theme.SUCCESS)
+            self.toast(f"Voice note saved: {destination.name}", "ok")
+            self.status_lbl.setText(str(destination))
+            self.status_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
         except Exception as exc:
             self.toast(f"Save failed: {exc}", "error")
         finally:
