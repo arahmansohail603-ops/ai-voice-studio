@@ -76,14 +76,24 @@ class VoskModelManager:
     def catalog_status(self, code: str = "") -> str:
         """Describe the catalog entry for this language, if there is one."""
         primary = model_base(code or self.language)
-        spec = self.manager.find_any(kind="stt", engine="vosk", language=primary)
+        spec = self.spec_for(primary)
         if spec is None:
             return "no Vosk model published for this language"
         return self.manager.status_line(spec)
 
     def spec_for(self, code: str = ""):
+        """The catalog spec published for exactly this language, or ``None``.
+
+        ``strict_language`` matters here. Without it a language nobody publishes
+        (Urdu, for one) falls back to the first Vosk spec in the catalog, so the
+        status line reports the English model as "Installed" and a genuine
+        "not published" turns into bogus "your files are damaged, download it
+        again" advice.
+        """
         primary = model_base(code or self.language)
-        return self.manager.find_any(kind="stt", engine="vosk", language=primary)
+        return self.manager.find_any(
+            kind="stt", engine="vosk", language=primary, strict_language=True
+        )
 
     # ----------------------------------------------------------------- ensure
     def ensure(self, language: str = "", on_status: Callable[[str], None] | None = None):

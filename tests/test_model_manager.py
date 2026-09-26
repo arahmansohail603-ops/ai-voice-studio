@@ -566,6 +566,65 @@ class ModelManagerTests(unittest.TestCase):
         self.assertGreater(free, 0)
         self.assertEqual(pending, 0)
 
+    def test_find_any_language_is_a_preference_by_default(self) -> None:
+        """The lenient fallback other callers rely on must keep working."""
+        self.manager.refresh()
+        fallback = self.manager.find_any(kind="stt", engine="vosk", language="ur")
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback.id, "vosk-en-us-0.15")
+
+    def test_find_any_strict_language_refuses_to_guess(self) -> None:
+        """"Is there a model for *this* language?" must be able to say no.
+
+        Without strict matching, a language nobody publishes borrows the first
+        catalog entry, so callers report an unrelated model as the answer.
+        """
+        self.manager.refresh()
+        self.assertIsNone(
+            self.manager.find_any(
+                kind="stt", engine="vosk", language="ur", strict_language=True
+            )
+        )
+
+    def test_find_any_strict_language_still_matches_a_region_prefix(self) -> None:
+        self.manager.refresh()
+        found = self.manager.find_any(
+            kind="stt", engine="vosk", language="en-GB", strict_language=True
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, "vosk-en-us-0.15")
+
+    def test_find_any_strict_language_matches_an_exact_tag(self) -> None:
+        self.manager.refresh()
+        found = self.manager.find_any(
+            kind="stt", engine="vosk", language="en-US", strict_language=True
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, "vosk-en-us-0.15")
+
+    def test_vosk_status_never_names_an_unrelated_model(self) -> None:
+        """A language with no model must not borrow another language's status.
+
+        This reached the user as "The installed 'Vosk English (US)' model is
+        missing its expected data - delete it and download it again", for Urdu:
+        a language the catalog never published, and a model that was perfectly
+        fine. Both the status line and the raised error had to be checked.
+        """
+        from app.core.vosk_engine import VoskModelManager
+
+        self.manager.refresh()
+        self.manager.install("vosk-en-us-0.15")
+        engine = VoskModelManager(self.staging / "vosk-layout", "ur", self.manager)
+
+        self.assertIsNone(engine.spec_for("ur"))
+        status = engine.catalog_status("ur")
+        self.assertIn("no Vosk model published", status)
+        self.assertNotIn("Installed", status)
+        self.assertNotIn("English", status)
+
+        # A language that *is* published still reports normally.
+        self.assertEqual(engine.spec_for("en-US").id, "vosk-en-us-0.15")
+
     def test_pending_bytes_before_install(self) -> None:
         self.manager.refresh()
         _free, pending = self.manager.disk_report()

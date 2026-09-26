@@ -154,5 +154,5 @@ def scroll_style(background: str = PANEL_BG) -> str:
         f"min-height: 24px; border-radius: 5px; }}"
         f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}"
         f"QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical "
-        "{{ background: transparent; }}"
+        f"{{ background: transparent; }}"
     )

@@ -93,9 +93,15 @@ class SpeechToTextScreen(Screen):
         self._label(controls_layout, "Engine:", 1, 3)
         engines = self.app.stt.available_engines() or ["vosk"]
         self.engine_menu = self._combo(controls, engines, 110)
-        self.engine_menu.setCurrentText(
-            self.app.stt.engine if self.app.stt.engine in engines else "vosk"
-        )
+        # Fall back to an engine the combo actually offers, not a hardcoded
+        # "vosk": a saved Vosk/Urdu pairing drops Vosk from available_engines
+        # (no model is published for Urdu), and selecting a name the list does
+        # not contain leaves the menu showing one engine while stt.engine keeps
+        # trying another. Syncing the engine too keeps the two in agreement.
+        selected = self.app.stt.engine if self.app.stt.engine in engines else engines[0]
+        self.engine_menu.setCurrentText(selected)
+        if selected != self.app.stt.engine:
+            self.app.stt.engine = selected
         self.engine_menu.currentTextChanged.connect(self._on_engine)
         controls_layout.addWidget(self.engine_menu, 1, 4)
 

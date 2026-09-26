@@ -182,7 +182,7 @@ class Toast(QLabel):
         self.setStyleSheet(
             f"QLabel {{ color: {theme.TEXT}; background: {theme.INPUT_BG}; "
             f"border: 1px solid {theme.BORDER}; border-radius: 8px; "
-            "padding: 10px 14px; }}"
+            "padding: 10px 14px; }"
         )
         self.hide()
 
@@ -194,10 +194,14 @@ class Toast(QLabel):
             "error": theme.DANGER,
         }.get(kind, theme.TEXT)
         self.setText(message)
+        # The closing brace is a single "}" on purpose: only an f-string turns
+        # "}}" into one brace, and this last fragment is a plain string. With
+        # "}}" here Qt rejected the whole sheet ("Could not parse stylesheet of
+        # object Toast") and the toast rendered unstyled.
         self.setStyleSheet(
             f"QLabel {{ color: {color}; background: {theme.INPUT_BG}; "
             f"border: 1px solid {theme.BORDER}; border-radius: 8px; "
-            "padding: 10px 14px; }}"
+            "padding: 10px 14px; }"
         )
         self.adjustSize()
         self._place()

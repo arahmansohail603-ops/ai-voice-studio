@@ -459,8 +459,22 @@ class ModelManager:
         return installed[0]
 
     def find_any(
-        self, *, kind: str = "", engine: str = "", language: str = ""
+        self,
+        *,
+        kind: str = "",
+        engine: str = "",
+        language: str = "",
+        strict_language: bool = False,
     ) -> ModelSpec | None:
+        """Best spec for the given filters.
+
+        ``language`` is a preference by default: when nothing publishes that
+        language the first remaining candidate comes back, which is what callers
+        asking "show me anything for STT" want. Pass ``strict_language=True``
+        when the answer is used as "does a model for *this* language exist?" --
+        the fallback would otherwise hand back an unrelated model and let the
+        caller report success for a language that was never published.
+        """
         candidates = self.all_specs()
         if kind:
             wanted = kind.strip().lower()
@@ -478,6 +492,8 @@ class ModelManager:
                         tag.split("-")[0].lower() == primary
                     ):
                         return spec
+        if language and strict_language:
+            return None
         return candidates[0]
 
     def status_line(self, spec: ModelSpec) -> str:
