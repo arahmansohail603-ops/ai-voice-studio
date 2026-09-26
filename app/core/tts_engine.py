@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import Future
 from pathlib import Path
 
@@ -49,6 +51,31 @@ def _last_lines(raw, count: int = 2) -> str:
         raw = raw.decode("utf-8", "replace")
     lines = [line.strip() for line in str(raw).splitlines() if line.strip()]
     return " ".join(lines[-count:])[:200]
+
+
+#: ``wave`` raises this from its own close() when a wav was opened and closed
+#: without a single sample ever being written -- ``setnchannels()`` is what
+#: writes the header, so it is never reached. Piper opens the output file
+#: before it synthesises anything, so whenever synthesis produces no audio
+#: this is the exception that leaves the process, and it lands on top of
+#: whatever really went wrong during synthesis.
+_PIPER_NO_AUDIO = "channels not specified"
+
+
+def _explain_piper_failure(detail: str) -> str:
+    """Name what Piper's raw stderr tail actually means.
+
+    Left alone, the "no audio" case reports a wave-module complaint, which
+    points the reader at the wav writer instead of at the empty or
+    unpronounceable text that caused it.
+    """
+    if _PIPER_NO_AUDIO in detail:
+        return (
+            "Piper produced no audio for this text, so the wav it had opened "
+            "was never given a channel count -- that wave error is a symptom, "
+            "not the cause. The text had nothing Piper could pronounce."
+        )
+    return detail
 
 
 class TTSEngine:
@@ -576,6 +603,14 @@ class TTSEngine:
                     "or pick a different voice."
                 ),
             )
+        if not text or not text.strip():
+            # Piper's input loop drops blank lines, so an empty request
+            # synthesises nothing and comes back as a wav that was opened,
+            # never written, and closed -- reported as a wave-module error
+            # that says nothing about the real problem.
+            raise TTSGenerationError(
+                "There is no text to speak. Type or paste some text first."
+            )
         model = voice.get("path")
         if not model or not Path(model).exists():
             raise TTSGenerationError(
@@ -594,20 +629,31 @@ class TTSEngine:
             "--length_scale", f"{length_scale:.3f}",
         ]
         try:
-            proc = subprocess.run(
-                cmd,
-                # Piper decodes stdin as UTF-8, so the text has to be encoded as
-                # UTF-8 here too. Passing a str with text=True would encode it
-                # with the Windows locale (cp1252), which mangles every
-                # non-ASCII script to nothing and leaves Piper synthesising
-                # zero audio -- surfacing as a baffling
-                # "wave.Error: # channels not specified".
-                input=text.encode("utf-8"),
-                capture_output=True,
-                timeout=300,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            with tempfile.TemporaryDirectory(prefix="ai-voice-piper-") as tmp:
+                # The text goes in a UTF-8 file rather than down a pipe.
+                # Piper's --input-file branch opens the path with an explicit
+                # encoding="utf-8", but its stdin is decoded with the *system*
+                # locale, which is cp1252 on this machine. Piping UTF-8 bytes
+                # into a cp1252 stdin leaves non-ASCII scripts undecodable, so
+                # Urdu and Korean text produced zero audio chunks -- and the
+                # wave error from Piper's close() then buried the real
+                # UnicodeDecodeError. A file sidesteps the locale entirely,
+                # and ASCII text cannot tell the two paths apart, so this
+                # only ever showed up on the non-English voices.
+                text_file = Path(tmp) / "input.txt"
+                text_file.write_text(text, encoding="utf-8")
+                cmd += ["--input-file", str(text_file)]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=300,
+                    check=False,
+                    # Piper also logs to stderr, so decode that as UTF-8 too
+                    # rather than letting it fall back to the locale and turn
+                    # a real message into mojibake.
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
         except FileNotFoundError as exc:
             raise MissingDependencyError("piper", "piper-tts") from exc
         except subprocess.TimeoutExpired as exc:
@@ -623,7 +669,10 @@ class TTSEngine:
             # The tail of the traceback carries the cause; the head is just
             # boilerplate frames, so truncating from the front hid the reason.
             detail = _last_lines(proc.stderr or proc.stdout, 2)
-            raise TTSGenerationError(f"Offline Piper synthesis failed. {detail}")
+            raise TTSGenerationError(
+                f"Offline Piper synthesis failed. "
+                f"{_explain_piper_failure(detail)}"
+            )
         return path
 
     def _pyttsx3_synth(
