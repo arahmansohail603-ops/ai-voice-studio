@@ -47,10 +47,18 @@ class DllLoadError(AppError):
     """Raised when a native library is present but fails to initialise.
 
     Windows reports this as ``[WinError 1114]`` ("DLL initialization routine
-    failed"). It usually means two AI packages are pulling in incompatible native
-    runtimes in the same process (torch vs ctranslate2, for example) -- the
-    package *is* installed, so re-installing or reconnecting to the internet
-    cannot help.
+    failed"). The usual cause on this app's Windows build is native runtime
+    *load order*: Qt5, CTranslate2 and torch each ship their own C++/OpenMP
+    runtime, Windows binds a DLL by base name, so the first one loaded is the
+    one all the others inherit. If Qt is imported before CTranslate2, the first
+    translation dies here even though every package is correctly installed --
+    so re-installing or reconnecting to the internet cannot help.
+
+    ``main.py`` calls
+    :func:`app.core.native_runtime.preload_native_runtime` before importing
+    PyQt5 precisely to make that order deterministic. Reaching this error means
+    that guard did not hold, so the report says so instead of advising a
+    restart the user has already tried.
     """
 
     def __init__(self, module: str, detail: str = ""):
@@ -59,9 +67,15 @@ class DllLoadError(AppError):
         msg = (
             f"The '{module}' native library could not start "
             f"(Windows DLL error 1114).{(' ' + detail) if detail else ''}"
-            "\nThis machine has loaded more than one AI runtime, and they conflict. "
-            "Restart the app and try again; if it persists, run translation on its "
-            "own before using the other engines."
+            "\n\nThis is a native library load-order conflict between the Qt UI "
+            "and the AI runtimes, not a missing or partial install, so "
+            "re-installing packages will not change it."
+            "\n\nWhat to do:"
+            "\n  1. Fully quit the app (check the tray and Task Manager) and start it"
+            "\n     again -- a second copy of the app running at once is the usual"
+            "\n     cause."
+            "\n  2. If it still fails, report this with the text above. It points at "
+            f"the\n     'app.core.native_runtime' preload in main.py, not at {module}."
         )
         super().__init__(msg)
 

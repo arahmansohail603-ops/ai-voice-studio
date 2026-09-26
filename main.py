@@ -10,6 +10,7 @@ from ctypes import wintypes
 from datetime import datetime, timezone
 
 from app import config
+from app.core.native_runtime import preload_native_runtime
 from app.licensing import (
     EncryptedLicenseStore,
     LicenseConfigurationError,
@@ -19,6 +20,12 @@ from app.licensing import (
     LicenseManager,
 )
 from app.licensing.crypto import parse_time
+
+# Must run before the PyQt5 import below. Windows binds a DLL by base name, so
+# whichever C++/OpenMP runtime loads first is the one every other native library
+# then binds against. Qt first + CTranslate2 (Argos) later fails with
+# [WinError 1114] on the first translation, on both the TTS and STT screens.
+preload_native_runtime()
 
 try:
     from PyQt5.QtCore import QMutex, QMutexLocker, QObject, QThread, QTimer, pyqtSignal

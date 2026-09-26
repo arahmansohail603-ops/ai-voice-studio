@@ -307,12 +307,16 @@ class VoiceStudioApp(QMainWindow):
 
     @staticmethod
     def _prewarm_translation() -> None:
-        """Load Argos' native libs before the TTS engine loads torch.
+        """Warm Argos' Python packages off the UI thread.
 
-        ctranslate2 and torch each bring their own native runtime and can fail
-        with Windows error 1114 ("DLL initialization routine failed") if the
-        wrong one gets there first. Importing Argos early, on its own thread,
-        keeps that ordering predictable.
+        This used to double as the guard against Windows error 1114, but it
+        could not be: it runs from ``_background_startup`` on a 0 ms timer, long
+        after Qt is loaded, and the first runtime bound into the process is the
+        one everything else inherits. The real guard is
+        :func:`app.core.native_runtime.preload_native_runtime`, called from
+        ``main.py`` before PyQt5 is imported. What is left here is the part that
+        is genuinely a background concern -- reading and importing the Argos
+        package so the first translation does not pay for it on the UI thread.
         """
         if not module_installed("argostranslate"):
             return

@@ -9,6 +9,9 @@ pyttsx3>=2.90
 SpeechRecognition>=3.10.1
 sounddevice>=0.4.6
 soundfile>=0.12.1
+# MP3 export/import runs through pydub, which needs an ffmpeg binary. This wheel
+# ships a static one, so MP3 works on a machine with no system ffmpeg installed.
+imageio-ffmpeg>=0.6.0
 pydub>=0.25.1
 numpy>=1.26.0
 pygame>=2.5.2; python_version < '3.13'
