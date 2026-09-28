@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "python manage.py collectstatic --noinput",
+  "installCommand": "pip install -r requirements.txt",
+  "functions": {
+    "config/wsgi.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{tests/**,**/test_*.py,fixtures/**,sample-data/**,db.sqlite3,staticfiles/**}"
+    }
+  }
+}
