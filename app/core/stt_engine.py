@@ -48,6 +48,15 @@ FLOOR_DELTA = 400.0
 
 _LEVEL_MAX = 32000.0
 
+# How long ``stop_listening`` waits for the capture and recognition threads on
+# the GUI thread. Deliberately short: this runs on the UI thread, so it is a
+# freeze, and a recogniser mid-``FinalResult`` can outlive any bound anyway. The
+# join is an optimisation, not the correctness mechanism -- each session owns its
+# own stop event and queue, so a thread that misses the deadline still stops on
+# its own and can never read the next session's audio. The cap just makes the
+# common Stop-then-Start case land cleanly instead of being refused.
+_STOP_JOIN_TIMEOUT = 1.0
+
 # Whisper identifies languages by *bare* ISO 639-1 code. The app's own codes are
 # already ISO 639-1, but a saved setting can carry a regional tag such as "ur-PK"
 # or "en-US", and Whisper answers anything that is not a plain code with
@@ -212,7 +221,14 @@ class STTEngine:
         on_level: Callable[[float], None] | None = None,
     ) -> bool:
         """Begin listening in the background. Returns False if mic busy/already running."""
-        if self._thread is not None and self._thread.is_alive():
+        # Both threads, not just the capture one. A recogniser draining its last
+        # phrase is alive for a good while after Stop, and letting a new session
+        # start alongside it used to leave two live recognisers for the rest of
+        # the process.
+        if any(
+            thread is not None and thread.is_alive()
+            for thread in (self._thread, self._worker)
+        ):
             return False
         if not self.check_microphone(raise_error=False):
             on_error(
@@ -223,17 +239,24 @@ class STTEngine:
             )
             return False
 
-        self._stop_event.clear()
-        self._queue = queue.Queue()
+        # A fresh event and queue per session, handed to the threads as
+        # arguments. Reassigning the shared attributes under a thread that was
+        # still reading them is what leaked the old recogniser: clearing the
+        # stop flag it was draining against meant it never saw its own stop, and
+        # rebinding the queue handed it the new session's audio.
+        stop_event = threading.Event()
+        audio_queue: queue.Queue = queue.Queue()
+        self._stop_event = stop_event
+        self._queue = audio_queue
         self._thread = threading.Thread(
             target=self._capture_loop,
-            args=(on_status, on_level, on_error),
+            args=(on_status, on_level, on_error, stop_event, audio_queue),
             name="stt-capture",
             daemon=True,
         )
         self._worker = threading.Thread(
             target=self._recognition_loop,
-            args=(on_text, on_status, on_error),
+            args=(on_text, on_status, on_error, stop_event, audio_queue),
             name="stt-recognizer",
             daemon=True,
         )
@@ -242,7 +265,17 @@ class STTEngine:
         return True
 
     def stop_listening(self) -> None:
+        """Stop capture and recognition, and wait for both to actually finish.
+
+        The join is the substance of the fix. Signalling alone let a restart
+        race the dying recogniser; with the per-session event and queue above
+        the two are now independent, so a thread that outlasts the timeout
+        still stops by itself instead of stealing the next session's audio.
+        """
         self._stop_event.set()
+        for thread in (self._thread, self._worker):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=_STOP_JOIN_TIMEOUT)
 
     @property
     def is_listening(self) -> bool:
@@ -252,7 +285,9 @@ class STTEngine:
         return self._vosk.model_info(self.language)
 
     # ------------------------------------------------------------ capture
-    def _capture_loop(self, on_status, on_level, on_error) -> None:
+    def _capture_loop(
+        self, on_status, on_level, on_error, stop_event, audio_queue
+    ) -> None:
         sd = soft_import("sounddevice")
         if sd is None:
             on_error(MissingDependencyError("sounddevice", "sounddevice"))
@@ -289,7 +324,7 @@ class STTEngine:
                 speech_seen = False
 
                 on_status("Listening…")
-                while not self._stop_event.is_set():
+                while not stop_event.is_set():
                     block, _ = stream.read(blocksize)
                     frame = block.astype(np.float32)
                     rms = float(np.sqrt((frame ** 2).mean()))
@@ -322,29 +357,31 @@ class STTEngine:
                         )
                         or (silent_blocks == 0 and phrase_blocks >= rolling_blocks)
                     ):
-                        self._ship(phrase)
+                        self._ship(audio_queue, phrase)
                         phrase = []
                         phrase_blocks = 0
                         speech_seen = False
 
                 if speech_seen and phrase_blocks >= min_blocks:
-                    self._ship(phrase)
+                    self._ship(audio_queue, phrase)
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
             on_error(exc)
 
-    def _ship(self, phrase: list[np.ndarray]) -> None:
+    def _ship(self, audio_queue: queue.Queue, phrase: list[np.ndarray]) -> None:
         try:
             from speech_recognition import AudioData as SRAudioData
         except ImportError:
             return
         data = np.concatenate(phrase).tobytes()
-        self._queue.put(SRAudioData(data, SAMPLE_RATE, 2))
+        audio_queue.put(SRAudioData(data, SAMPLE_RATE, 2))
 
     # -------------------------------------------------------- recognition
-    def _recognition_loop(self, on_text, on_status, on_error) -> None:
-        while not self._stop_event.is_set() or not self._queue.empty():
+    def _recognition_loop(
+        self, on_text, on_status, on_error, stop_event, audio_queue
+    ) -> None:
+        while not stop_event.is_set() or not audio_queue.empty():
             try:
-                audio = self._queue.get(timeout=0.25)
+                audio = audio_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
             if audio is None:

@@ -222,6 +222,23 @@ class ModelsScreenTests(unittest.TestCase):
         self.assertFalse(row.delete_btn.isVisible())
         self.assertFalse(row.progress.isVisible())
 
+    def test_a_multi_gigabyte_model_does_not_overflow_the_progress_bar(self):
+        # QProgressBar.setRange takes a C++ int, so a model over ~2.1 GB raised
+        # OverflowError inside this slot and PyQt5 aborted the whole process.
+        # A 4 GB XTTS/Qwen-sized model is a routine download, not an edge case.
+        from app.gui.widgets import PROGRESS_SCALE
+
+        self.screen._rebuild()
+        row = self.screen._rows["stt-vosk-en"]
+        total = 4_300_000_000
+        self.assertGreater(total, 2**31 - 1, "fixture no longer exceeds int32")
+        for received in (0, 1, total // 2, total, total + 1):
+            row.show_progress("downloading", received, total, "half way")
+            self.assertEqual(row.progress.maximum(), PROGRESS_SCALE)
+            self.assertLessEqual(row.progress.value(), PROGRESS_SCALE)
+        self.assertEqual(row.progress.value(), PROGRESS_SCALE)
+        self.assertEqual(row.progress.format(), "100%")
+
     def test_download_through_the_screen_installs_and_updates_the_row(self):
         self.screen._rebuild()
         row = self.screen._rows["stt-vosk-en"]

@@ -39,7 +39,7 @@ from app.core.model_manager import (
     human_size,
 )
 from app.gui import theme
-from app.gui.widgets import BusyButton, Screen
+from app.gui.widgets import PROGRESS_SCALE, BusyButton, Screen, progress_value, ui_slot
 
 _KIND_LABELS = {
     "stt": "Speech recognition",
@@ -265,8 +265,11 @@ class _Row(QFrame):
     def show_progress(self, stage: str, received: int, total: int, detail: str) -> None:
         self.progress.setVisible(True)
         if total > 0:
-            self.progress.setRange(0, total)
-            self.progress.setValue(received)
+            # A fraction, not a byte count: setRange takes a C++ int, so a
+            # multi-GB model would overflow it and kill the process from inside
+            # this slot. See app.gui.widgets.PROGRESS_SCALE.
+            self.progress.setRange(0, PROGRESS_SCALE)
+            self.progress.setValue(progress_value(received, total))
             percent = int(received * 100 / total)
             self.progress.setFormat(f"{percent}%")
         else:
@@ -475,6 +478,7 @@ class ModelsScreen(Screen):
         self.summary.setStyleSheet(theme.label_style(color, "left"))
 
     # --------------------------------------------------------------- actions
+    @ui_slot
     def _on_refresh(self) -> None:
         if self._refresh_worker is not None and self._refresh_worker.isRunning():
             return
@@ -487,6 +491,7 @@ class ModelsScreen(Screen):
         self._refresh_worker = worker
         worker.start()
 
+    @ui_slot
     def _on_refreshed(self, count: int, source: str) -> None:
         self._release_refresh_worker()
         self._rebuild()
@@ -496,6 +501,7 @@ class ModelsScreen(Screen):
             theme.SUCCESS,
         )
 
+    @ui_slot
     def _on_refresh_failed(self, message: str) -> None:
         self._release_refresh_worker()
         self._show_message(message, theme.DANGER)
@@ -507,6 +513,7 @@ class ModelsScreen(Screen):
         if worker is not None:
             worker.deleteLater()
 
+    @ui_slot
     def _on_download(self, spec_id: str) -> None:
         if spec_id in self._workers:
             return
@@ -563,6 +570,7 @@ class ModelsScreen(Screen):
             row.show_progress(STAGE_FETCHING, 0, 0, "Starting…")
         worker.start()
 
+    @ui_slot
     def _on_delete(self, spec_id: str) -> None:
         row = self._rows.get(spec_id)
         spec = row.spec if row is not None else None
@@ -589,10 +597,12 @@ class ModelsScreen(Screen):
         self._update_summary()
         self._show_message(f"Removed '{name}'.", theme.SUBTEXT)
 
+    @ui_slot
     def _on_cancel(self, spec_id: str) -> None:
         self.manager.cancel()
 
     # -------------------------------------------------------------- progress
+    @ui_slot
     def _on_progress(
         self, spec_id: str, received: int, total: int, stage: str, detail: str
     ) -> None:
@@ -601,6 +611,7 @@ class ModelsScreen(Screen):
             return
         row.show_progress(stage, received, total, detail)
 
+    @ui_slot
     def _on_succeeded(self, spec_id: str, was_fresh: bool) -> None:
         worker = self._workers.pop(spec_id, None)
         if worker is not None:
@@ -614,6 +625,7 @@ class ModelsScreen(Screen):
         self._update_summary()
         self._show_message(f"{row.spec.name} is ready." if row else "Model is ready.", theme.SUCCESS)
 
+    @ui_slot
     def _on_failed(self, spec_id: str, message: str) -> None:
         worker = self._workers.pop(spec_id, None)
         if worker is not None:

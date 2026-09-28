@@ -25,7 +25,6 @@ from app.config import STT_LANGUAGES, language_display_name
 from app.core import audio_utils
 from app.core.errors import module_installed
 from app.core.recorder import Recorder, list_input_devices
-from app.core.stt_engine import STTEngine
 from app.gui import theme
 from app.gui.widgets import Screen
 from app.services import file_service
@@ -401,12 +400,33 @@ class SettingsScreen(Screen):
         )
         self.fallback_voice_menu.setCurrentText(selected)
 
+    @staticmethod
+    def _device_label(device: dict) -> str:
+        """A label that tells two same-named devices apart.
+
+        Windows happily exposes the same microphone through several host APIs
+        (MME, WASAPI, WDM-KS) with different native rates, and they do not all
+        accept the same formats. Showing the bare name made them look like one
+        entry, and picking it silently resolved to whichever was listed last --
+        often a 48 kHz one that cannot open at 44.1 kHz.
+        """
+        parts = [device["name"]]
+        details = [part for part in (device.get("hostapi"),) if part]
+        if device.get("samplerate"):
+            details.append(f"{device['samplerate']} Hz")
+        if details:
+            parts.append(f"({', '.join(details)})")
+        return " - ".join(parts)
+
     def _populate_devices(self) -> None:
         try:
             devices = list_input_devices()
         except Exception:
             devices = []
-        self._device_map = {device["name"]: device["index"] for device in devices}
+        # Keyed by index, not name: identical names must stay separate rows.
+        self._device_map = {
+            self._device_label(device): device["index"] for device in devices
+        }
         values = list(self._device_map) or ["No input devices found"]
         self._set_items(self.device_menu, values)
         saved = self.app.settings.get("recorder", "device")
@@ -474,10 +494,20 @@ class SettingsScreen(Screen):
         self._recreate_recorder()
 
     def _recreate_recorder(self) -> None:
+        previous = self.app.recorder
+        if previous.is_recording:
+            # Recorder closes its PortAudio stream only in stop(), and it has no
+            # finaliser, so simply dropping the reference stranded the callback
+            # thread and its buffers. The replacement reports "not recording",
+            # so the screen whose Stop button was still enabled would answer
+            # "Nothing to stop." and there was no way left to close the stream.
+            previous.stop()
         self.app.recorder = Recorder(
             samplerate=int(self.app.settings.get("recorder", "samplerate", 44100)),
             channels=int(self.app.settings.get("recorder", "channels", 1)),
-            device=self.app.settings.get("recorder", "device"),
+            # Same guard as startup: a device that cannot record must never
+            # become the live recorder, however it got into the settings.
+            device=self.app._usable_mic_device(),
         )
 
     def _on_fallback_voice(self, value: str) -> None:
@@ -491,7 +521,15 @@ class SettingsScreen(Screen):
         if not chosen:
             return
         resolved = Path(chosen).resolve()
-        file_service.set_output_root(resolved)
+        try:
+            file_service.set_output_root(resolved)
+        except OSError as exc:
+            # A folder that cannot be created -- a file in the way, a
+            # disconnected drive, no permission. Unhandled, this escapes a Qt
+            # slot and PyQt5's default handler calls qFatal(), killing the whole
+            # app over a folder picker.
+            self.toast(f"That folder cannot be used: {exc}", "error")
+            return
         self.app.settings.set("output", "folder", str(resolved))
         self.folder_var.set(str(resolved))
         self.folder_entry.setText(str(resolved))

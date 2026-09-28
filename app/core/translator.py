@@ -55,6 +55,14 @@ def _guess_source(text: str) -> str:
     """Cheap script-based source guess (Argos needs an explicit source code)."""
     if re.search(r"[\u0900-\u097F]", text):
         return "hi"
+    # Checked before the generic Arabic block because Urdu is written in the
+    # Arabic script and shares its whole U+0600-U+06FF range, so the test below
+    # used to claim every Urdu sentence as Arabic: the wrong language package
+    # was looked for, downloaded with consent, and its output returned with no
+    # error at any layer. These six letters are the ones Urdu uses and standard
+    # Arabic does not, so their presence is an unambiguous signal.
+    if re.search(r"[\u067E\u0686\u0698\u06BA\u06D2\u06D3]", text):
+        return "ur"
     if re.search(r"[\u0600-\u06FF]", text):
         return "ar"
     if re.search(r"[\u3040-\u30FF\u4E00-\u9FFF]", text):

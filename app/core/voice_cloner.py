@@ -29,10 +29,16 @@ XTTS_LANGUAGES = [
 ]
 
 
+# Reference-recording limits. Named so the recording UI and this validator
+# cannot drift apart: the UI auto-stops at MAX and refuses anything under MIN.
+MIN_SAMPLE_SECONDS: float = 3.0
+MAX_SAMPLE_SECONDS: float = 40.0
+
+
 def validate_reference_sample(
     path: str | Path,
-    min_seconds: float = 3.0,
-    max_seconds: float = 40.0,
+    min_seconds: float = MIN_SAMPLE_SECONDS,
+    max_seconds: float = MAX_SAMPLE_SECONDS,
 ) -> None:
     """Shared sanity checks for a reference voice recording (all clone engines)."""
     from app.core import audio_utils
@@ -68,6 +74,7 @@ class VoiceCloner:
         self._state = CloneState.NOT_LOADED
         self._error = ""
         self._tts = None
+        self._device = "cpu"
         self._load_thread: threading.Thread | None = None
         self._synth_thread: threading.Thread | None = None
         self._sync_lock = threading.Lock()
@@ -80,6 +87,22 @@ class VoiceCloner:
     @property
     def error(self) -> str:
         return self._error
+
+    @property
+    def device(self) -> str:
+        """``"cuda"`` or ``"cpu"`` -- resolved when the model loads."""
+        return self._device
+
+    @staticmethod
+    def _cuda_available() -> bool:
+        try:
+            import torch
+        except ImportError:
+            return False
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception:  # pragma: no cover - a broken driver is not a GPU
+            return False
 
     @property
     def is_loading(self) -> bool:
@@ -107,13 +130,29 @@ class VoiceCloner:
 
         self._state = CloneState.LOADING
         self._error = ""
-        on_change(self._state, "Loading voice-cloning model… first run downloads ~2 GB.")
+        # Resolve the device before announcing, so the user is told where the
+        # work will happen instead of discovering it from the speed.
+        use_gpu = self._cuda_available()
+        self._device = "cuda" if use_gpu else "cpu"
+        device_note = "CUDA (GPU)" if use_gpu else "CPU (slow)"
+        on_change(
+            self._state,
+            f"Loading voice-cloning model… first run downloads ~2 GB. "
+            f"Runtime: {device_note}.",
+        )
 
         def _load() -> None:
             try:
                 from TTS.api import TTS as CoquiTTS  # noqa: N814
 
-                model = CoquiTTS(model_name=XTTS_MODEL_NAME, progress_bar=False)
+                # Must be passed explicitly. This coqui-tts build defaults
+                # ``gpu`` to False rather than None, so omitting it pinned every
+                # machine -- including ones with a perfectly good NVIDIA GPU --
+                # to the CPU. Passing True on a machine with no CUDA would raise
+                # instead of falling back, hence the explicit boolean.
+                model = CoquiTTS(
+                    model_name=XTTS_MODEL_NAME, progress_bar=False, gpu=use_gpu
+                )
                 with self._sync_lock:
                     self._tts = model
                     self._state = CloneState.READY

@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: ai-voice-studio-license
+    runtime: python
+    plan: free
+    rootDir: server
+    buildCommand: pip install -r requirements.txt && python manage.py collectstatic --noinput
+    startCommand: python manage.py migrate --noinput && gunicorn config.wsgi:application --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health/
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: DJANGO_DEBUG
+        value: "0"
+      - key: DJANGO_ALLOWED_HOSTS
+        value: ai-voice-studio-license.onrender.com
+      - key: DJANGO_SECURE_SSL_REDIRECT
+        value: "1"
+      - key: DJANGO_CSRF_TRUSTED_ORIGINS
+        value: https://ai-voice-studio-license.onrender.com
+      - key: DJANGO_TRUST_PROXY_SSL_HEADER
+        value: "1"
+      - key: LICENSE_TRUST_PROXY_HEADERS
+        value: "1"
+      - key: LICENSE_LEASE_DURATION_SECONDS
+        value: "2592000"
+      - key: DJANGO_SECRET_KEY
+        sync: false
+      - key: LICENSE_HMAC_PEPPER
+        sync: false
+      - key: LICENSE_SIGNING_KEY_ID
+        value: local-v1
+      - key: LICENSE_SIGNING_KEYS
+        sync: false
+      - key: DATABASE_URL
+        sync: false

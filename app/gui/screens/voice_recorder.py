@@ -182,6 +182,25 @@ class VoiceRecorderScreen(Screen):
     def on_hide(self) -> None:
         self._tracking = False
         self._track_timer.stop()
+        # Leaving the screen must not leave the microphone open. The recorder
+        # outlives this screen and is shared with My Voice, so an abandoned
+        # recording kept the OS mic indicator on and kept appending 50 ms
+        # blocks to a list with no cap -- roughly 635 MB an hour, for the rest
+        # of the session, with nothing left on screen able to stop it. Closing
+        # the window went through here too, so the process had to be killed
+        # from Task Manager. My Voice already stops the shared recorder here.
+        if self.app.recorder.is_recording:
+            self._abandon_recording()
+
+    def _abandon_recording(self) -> None:
+        """Release the microphone without keeping the audio."""
+        self.app.recorder.stop()
+        self._recorded_seconds = 0.0
+        self._draft = None
+        self.record_btn.set_busy(False)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸ Pause")
+        self.stop_btn.setEnabled(False)
 
     def _update_mic_status(self) -> None:
         try:

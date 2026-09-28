@@ -15,11 +15,8 @@ tests pin the three states apart: installed, downloadable, and impossible.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
-import os
 import threading
-import time
 import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,7 +28,6 @@ from app.core.piper_voices import (
     DOWNLOADABLE,
     INSTALLED,
     UNKNOWN,
-    UNPUBLISHED,
     PiperVoiceLibrary,
     VoiceEntry,
     is_speakable,
@@ -156,20 +152,77 @@ def _catalog_blob() -> bytes:
     return json.dumps(voices).encode("utf-8")
 
 
+def _bulk_catalog_blob() -> tuple[bytes, dict[str, bytes]]:
+    """A catalog where *every* voice has both files, so all of them complete.
+
+    Returns the catalog bytes plus the payloads to serve for its entries.
+    """
+    voices = {}
+    blobs: dict[str, bytes] = {}
+    for index, (family, country) in enumerate(
+        (("ur", "Pakistan"), ("hi", "India"), ("cy", "United Kingdom"),
+         ("en", "United States"))
+    ):
+        key = f"{family}_XX-v{index}-medium"
+        model = f"model-{key}".encode() * 32
+        config = json.dumps({"language": {"code": key}}).encode()
+        model_path = f"{family}/{key}/medium/{key}.onnx"
+        config_path = f"{family}/{key}/medium/{key}.onnx.json"
+        blobs[model_path] = model
+        blobs[config_path] = config
+        voices[key] = {
+            "key": key,
+            "name": f"v{index}",
+            "language": {
+                "code": key,
+                "family": family,
+                "name_native": key,
+                "name_english": family.upper(),
+                "country_english": country,
+            },
+            "quality": "medium",
+            "num_speakers": 1,
+            "files": {
+                model_path: {"size_bytes": len(model), "md5_digest": _md5(model)},
+                config_path: {"size_bytes": len(config), "md5_digest": _md5(config)},
+            },
+        }
+    return json.dumps(voices).encode("utf-8"), blobs
+
+
+_BULK_CATALOG, _BULK_BLOBS = _bulk_catalog_blob()
+
+
 class _Fixture:
     """A local HTTP server serving a fake catalog and voice payloads."""
 
-    def __init__(self, truncate: str | None = None) -> None:
+    def __init__(
+        self,
+        truncate: str | None = None,
+        catalog: bytes | None = None,
+        supports_range: bool = False,
+        cut_after: int | None = None,
+    ) -> None:
         self._blobs = {
-            "voices.json": _catalog_blob(),
+            "voices.json": catalog if catalog is not None else _catalog_blob(),
             "ur/ur_PK/fasih/medium/ur_PK-fasih-medium.onnx": _ONNX,
             "ur/ur_PK/fasih/medium/ur_PK-fasih-medium.onnx.json": _CONFIG,
             "hi/hi_IN/pratham/medium/hi_IN-pratham-medium.onnx": _ONNX,
             "cy/cy_GB/gwydion/medium/cy_GB-gwydion-medium.onnx": _ONNX,
             "en/en_US/corrupt/medium/en_US-corrupt-medium.onnx": _ONNX,
         }
+        if catalog is not None:
+            self._blobs.update(_BULK_BLOBS)
+
         # Optionally serve a short body so the size check has something to catch.
         self._truncate = truncate
+        self._supports_range = supports_range
+        self._cut_after = cut_after
+        self._cut_done: set[str] = set()
+        #: Every path the client asked for, in order, so tests can prove that a
+        #: second install touches the network zero times.
+        self.requests: list[str] = []
+        self.ranges: list[str] = []
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -178,15 +231,45 @@ class _Fixture:
 
             def do_GET(self):
                 # self.path includes the leading slash; the blob keys do not.
-                body = fixture._blobs.get(self.path.lstrip("/"))
+                key = self.path.lstrip("/")
+                fixture.requests.append(key)
+                body = fixture._blobs.get(key)
                 if body is None:
                     self.send_error(404)
                     return
                 if fixture._truncate and self.path.endswith(fixture._truncate):
                     body = body[: len(body) // 2]
-                self.send_response(200)
+
+                start = 0
+                header = self.headers.get("Range")
+                if header and fixture._supports_range:
+                    fixture.ranges.append(header)
+                    start = int(header.split("=", 1)[1].split("-", 1)[0])
+                    if start >= len(body):
+                        self.send_error(416)
+                        return
+                    body = body[start:]
+
+                whole = len(fixture._blobs[key])
+                self.send_response(206 if start else 200)
                 self.send_header("Content-Length", str(len(body)))
+                if start:
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{whole - 1}/{whole}"
+                    )
                 self.end_headers()
+                # Hang up mid-body once, to imitate a dropped connection. The
+                # declared Content-Length is then a lie, which is exactly what
+                # makes http.client raise IncompleteRead on the client side.
+                # The index is exempt: a truncated catalog is a different bug.
+                if (fixture._cut_after is not None
+                        and key not in fixture._cut_done
+                        and key != "voices.json"):
+                    fixture._cut_done.add(key)
+                    self.wfile.write(body[: fixture._cut_after])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 self.wfile.write(body)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -198,6 +281,9 @@ class _Fixture:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}/"
 
+    def count(self, suffix: str) -> int:
+        return sum(1 for path in self.requests if path.endswith(suffix))
+
     def close(self) -> None:
         self._server.shutdown()
         self._server.server_close()
@@ -207,9 +293,19 @@ class _LibraryTestCase(unittest.TestCase):
     """Base class that serves a fake catalog over HTTP."""
 
     truncate: str | None = None
+    catalog: bytes | None = None
+    supports_range = False
+    cut_after: int | None = None
+    #: Retry sleeps make tests slow, so they are removed by default.
+    backoff: tuple[float, ...] = (0.0, 0.0, 0.0)
 
     def setUp(self) -> None:
-        self._fixture = _Fixture(truncate=self.truncate)
+        self._fixture = _Fixture(
+            truncate=self.truncate,
+            catalog=self.catalog,
+            supports_range=self.supports_range,
+            cut_after=self.cut_after,
+        )
         self._tmp = TemporaryDirectory()
         self.voice_dir = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
@@ -225,6 +321,9 @@ class _LibraryTestCase(unittest.TestCase):
             unittest.mock.patch.object(
                 piper_voices, "PIPER_VOICE_DIR", self.voice_dir
             ),
+            unittest.mock.patch.object(
+                piper_voices, "_RETRY_BACKOFF_SECONDS", self.backoff
+            ),
         )
         for patch in patches:
             patch.start()
@@ -233,6 +332,10 @@ class _LibraryTestCase(unittest.TestCase):
 
     def entry(self, key: str) -> VoiceEntry:
         return next(e for e in self.library.catalog() if e.key == key)
+
+    @property
+    def fixture(self) -> _Fixture:
+        return self._fixture
 
 
 class SupportedLanguageTests(unittest.TestCase):
@@ -510,6 +613,222 @@ class VoiceEntryTests(unittest.TestCase):
 
     def test_bad_speaker_count_falls_back_to_one(self):
         self.assertEqual(VoiceEntry({"num_speakers": "many"}).speakers, 1)
+
+
+class _BulkTestCase(_LibraryTestCase):
+    """Base for the prefetch tests: a catalog where every voice completes."""
+
+    catalog = _BULK_CATALOG
+
+    @property
+    def bulk_keys(self) -> list[str]:
+        return [e.key for e in self.library.catalog()]
+
+
+class ResumeTests(_BulkTestCase):
+    """A connection that dies mid-file must be continued, not restarted.
+
+    The server throttles to about 1 MB/s, so a full prefetch runs for hours.
+    Restarting a voice from zero after one dropped connection is the difference
+    between finishing and never finishing.
+    """
+
+    supports_range = True
+    cut_after = 64
+
+    def test_a_dropped_connection_resumes_the_file(self):
+        result = self.library.install_all()
+
+        self.assertEqual(result.failed, [])
+        self.assertEqual(len(result.installed), 4)
+        for entry in self.library.catalog():
+            self.assertTrue(
+                self.library.is_installed(entry),
+                f"{entry.key} never became usable",
+            )
+
+    def test_the_retry_asks_for_the_rest_of_the_file(self):
+        self.library.install_all()
+
+        self.assertTrue(
+            self.fixture.ranges,
+            "the client never sent a Range header, so it refetched from zero",
+        )
+
+    def test_the_resumed_file_has_the_right_bytes(self):
+        self.library.install_all()
+
+        for path, payload in _BULK_BLOBS.items():
+            if path.endswith(".onnx"):
+                self.assertEqual(
+                    (self.voice_dir / Path(path).name).read_bytes(), payload
+                )
+
+    def test_no_partial_file_survives_a_successful_run(self):
+        self.library.install_all()
+        self.assertEqual(list(self.voice_dir.glob("*.part")), [])
+
+
+class RangeIgnoredTests(_BulkTestCase):
+    """A server that ignores Range must not have bytes appended to it."""
+
+    def test_a_stale_partial_file_is_replaced_not_appended_to(self):
+        model = "ur/ur_XX-v0-medium/medium/ur_XX-v0-medium.onnx"
+        part = self.voice_dir / (Path(model).name + ".part")
+        part.write_bytes(b"stale rubbish from a previous attempt")
+
+        self.library.install_all()
+
+        self.assertEqual((self.voice_dir / Path(model).name).read_bytes(),
+                         _BULK_BLOBS[model])
+        self.assertEqual(list(self.voice_dir.glob("*.part")), [])
+
+
+class MissingConfigReuseTests(_BulkTestCase):
+    """A voice missing only its config must not refetch the whole model."""
+
+    def test_the_existing_model_is_kept_and_only_the_config_is_fetched(self):
+        model = "ur/ur_XX-v0-medium/medium/ur_XX-v0-medium.onnx"
+        config = "ur/ur_XX-v0-medium/medium/ur_XX-v0-medium.onnx.json"
+        self.library.install(self.library.catalog()[0])
+
+        onnx = self.voice_dir / Path(model).name
+        stamp = onnx.stat().st_mtime_ns
+        (self.voice_dir / Path(config).name).unlink()
+        self.fixture.requests.clear()
+
+        self.library.install(self.library.catalog()[0])
+
+        self.assertEqual(onnx.stat().st_mtime_ns, stamp,
+                         "the 20 MB model was downloaded a second time")
+        self.assertEqual(self.fixture.count(".onnx"), 0)
+        self.assertEqual(self.fixture.count(".onnx.json"), 1)
+        self.assertTrue((self.voice_dir / Path(config).name).is_file())
+
+
+class BulkInstallTests(_BulkTestCase):
+    """Fetching every voice in one run."""
+
+    def test_every_voice_is_installed(self):
+        result = self.library.install_all()
+
+        self.assertTrue(result.ok, result.summary())
+        self.assertEqual(len(result.installed), 4)
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(result.failed, [])
+
+    def test_a_second_run_downloads_nothing(self):
+        self.library.install_all()
+        self.fixture.requests.clear()
+
+        result = self.library.install_all()
+
+        self.assertEqual(self.fixture.requests, [],
+                         "a completed prefetch hit the network again")
+        self.assertEqual(result.installed, [])
+        self.assertEqual(len(result.skipped), 4)
+        self.assertTrue(result.ok)
+
+    def test_progress_is_monotonic_and_reaches_the_total(self):
+        seen: list[tuple[int, int]] = []
+        self.library.install_all(
+            on_progress=lambda stage, got, total, label: seen.append((got, total))
+        )
+
+        self.assertTrue(seen, "no progress reported")
+        self.assertEqual(seen, sorted(seen), "progress went backwards")
+        self.assertEqual(seen[-1][0], seen[-1][1],
+                         "progress never reached the grand total")
+
+    def test_progress_names_the_voice_and_its_position(self):
+        labels: list[str] = []
+        self.library.install_all(
+            on_progress=lambda stage, got, total, label: labels.append(label)
+        )
+
+        self.assertTrue(all("/4" in label for label in labels),
+                        f"label did not show the running position: {labels[:3]}")
+
+    def test_one_broken_voice_does_not_abandon_the_rest(self):
+        real = self.library.install
+
+        def flaky(entry, *args, **kwargs):
+            if entry.key == "hi_XX-v1-medium":
+                raise piper_voices.NetworkError("simulated server error")
+            return real(entry, *args, **kwargs)
+
+        with unittest.mock.patch.object(self.library, "install", side_effect=flaky):
+            result = self.library.install_all()
+
+        self.assertEqual(len(result.installed), 3)
+        self.assertEqual([name for name, _ in result.failed], ["hi_XX-v1-medium"])
+        self.assertFalse(result.ok)
+        self.assertIn("hi_XX-v1-medium", result.summary())
+
+    def test_stopping_keeps_the_voices_already_finished(self):
+        def stop_once_finished():
+            return len(self.library.installed()) >= 1
+
+        result = self.library.install_all(should_cancel=stop_once_finished)
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(len(result.installed), 1)
+        self.assertIn("Stopped", result.summary())
+
+    def test_resuming_after_a_stop_only_fetches_what_is_missing(self):
+        def stop_once_finished():
+            return len(self.library.installed()) >= 1
+
+        self.library.install_all(should_cancel=stop_once_finished)
+        finished = self.library.installed()
+        self.fixture.requests.clear()
+
+        result = self.library.install_all()
+
+        self.assertTrue(result.ok, result.summary())
+        self.assertEqual(len(result.skipped), len(finished))
+        for path in self.fixture.requests:
+            stem = Path(path).name.split(".")[0]
+            self.assertNotIn(stem, finished,
+                             f"refetched a voice that was already installed: {path}")
+
+    def test_cancelling_before_the_first_voice_fetches_nothing(self):
+        result = self.library.install_all(should_cancel=lambda: True)
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(result.installed, [])
+        self.assertEqual(self.library.installed(), set())
+
+    def test_an_empty_catalog_is_an_error(self):
+        with self.assertRaises(piper_voices.NetworkError):
+            self.library.install_all(entries=[])
+
+    def test_remaining_reports_the_work_left_to_do(self):
+        # The screen hands over the catalog it already loaded; remaining() only
+        # ever reads the cache so it can never block the UI thread on a fetch.
+        entries = self.library.catalog()
+        count, total = self.library.remaining(entries)
+        self.assertEqual(count, 4)
+        self.assertGreater(total, 0)
+
+        self.library.install_all()
+        self.assertEqual(self.library.remaining(entries), (0, 0))
+
+
+class FreeSpaceTests(_BulkTestCase):
+    """Refuse up front rather than filling the disk and failing later."""
+
+    def test_a_short_disk_is_refused_before_anything_is_fetched(self):
+        with self.assertRaises(piper_voices.TTSGenerationError) as caught:
+            self.library.install_all(free_bytes=1024)
+
+        self.assertIn("free disk", str(caught.exception))
+        self.assertEqual(self.fixture.count(".onnx"), 0)
+        self.assertEqual(self.library.installed(), set())
+
+    def test_enough_space_is_accepted(self):
+        result = self.library.install_all(free_bytes=64 * 1024 * 1024 * 1024)
+        self.assertTrue(result.ok, result.summary())
 
 
 if __name__ == "__main__":  # pragma: no cover

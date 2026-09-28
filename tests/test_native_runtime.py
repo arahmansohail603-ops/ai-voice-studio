@@ -16,6 +16,7 @@ bad order legal, that is an improvement to record, not a regression to fail on.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -63,6 +64,15 @@ def _urdu_available() -> bool:
 
 
 def _run(script: str) -> subprocess.CompletedProcess:
+    # The child inherits this process's stdout, which Windows binds to the
+    # active ANSI code page (cp1252 here). The guarded script translates into
+    # Urdu and prints it, so without this the child died on a
+    # UnicodeEncodeError at the print -- after the translation had already
+    # succeeded -- and the test reported a broken native-runtime guard that
+    # was in fact working. ``main._force_utf8_streams()`` is the app's own
+    # version of this fix; these scripts do not enter through ``main``, so they
+    # need it applied for them.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     return subprocess.run(
         [sys.executable, "-c", script.format(root=str(_ROOT))],
         capture_output=True,
@@ -70,6 +80,7 @@ def _run(script: str) -> subprocess.CompletedProcess:
         timeout=600,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
 
 
@@ -213,6 +224,216 @@ class TranslationAfterQtTests(unittest.TestCase):
                 result.stdout,
                 msg="expected the failure to surface, not vanish",
             )
+
+
+class _FakeStream:
+    def __init__(self) -> None:
+        self.encoding = "cp1252"
+        self.errors = "strict"
+        self.reconfigured: dict | None = None
+
+    def reconfigure(self, **kwargs) -> None:
+        self.reconfigured = kwargs
+
+
+class StreamEncodingTests(unittest.TestCase):
+    """``main`` must widen the console streams before anything can print.
+
+    Every feature in this app can produce non-ASCII text: Urdu and Hindi STT
+    output, translated strings, file names from the History screen. Windows
+    binds stdout/stderr to the ANSI code page, so one such write raises
+    UnicodeEncodeError and takes the whole process down mid-session. The
+    window keeps the app looking alive, which makes this very hard to report
+    back, so the guard runs before the licensing dialog opens.
+    """
+
+    def test_reconfigure_is_applied_to_both_streams(self) -> None:
+        import main
+
+        out, err = _FakeStream(), _FakeStream()
+        with unittest.mock.patch.object(sys, "stdout", out), unittest.mock.patch.object(
+            sys, "stderr", err
+        ):
+            main._force_utf8_streams()
+
+        for stream in (out, err):
+            self.assertIsNotNone(stream.reconfigured, "stream was left on cp1252")
+            self.assertEqual(stream.reconfigured["encoding"], "utf-8")
+            # Not "replace" or "ignore": that would silently corrupt the text
+            # the user is looking at. Anything still unencodable has to stay
+            # visible in the log as an escape.
+            self.assertEqual(stream.reconfigured["errors"], "backslashreplace")
+
+    def test_a_closed_stream_does_not_stop_startup(self) -> None:
+        import main
+
+        class Detached(_FakeStream):
+            def reconfigure(self, **kwargs) -> None:
+                raise ValueError("underlying buffer has been detached")
+
+        with unittest.mock.patch.object(sys, "stdout", Detached()):
+            main._force_utf8_streams()  # must not raise
+
+
+class StartupFailureIsVisibleTests(unittest.TestCase):
+    """A startup failure must reach the screen, not just stderr.
+
+    ``build.py`` passes ``--noconsole``, so in a packaged build stderr is
+    discarded. Both pre-window exits -- licensing not configured, and a data
+    folder that cannot be created -- used to print there and return 1, which the
+    user experiences as a shortcut that does nothing at all. There is no error to
+    report and no window to look at, so the app just looks broken.
+
+    The dialog is the whole point of the fix, so these assert it is raised and
+    that the text actually explains the problem.
+    """
+
+    def _capture_dialog(self, call):
+        import main
+
+        shown = []
+
+        class _Box:
+            @staticmethod
+            def critical(_parent, title, message):
+                shown.append((title, message))
+
+        with unittest.mock.patch(
+            "PyQt5.QtWidgets.QMessageBox.critical", _Box.critical
+        ), unittest.mock.patch.object(main, "QApplication", object()):
+            call()
+        return shown
+
+    def test_missing_dependencies_raise_a_dialog(self) -> None:
+        import main
+
+        def run():
+            with unittest.mock.patch.object(main.importlib, "import_module") as fake:
+                fake.side_effect = lambda name: (
+                    (_ for _ in ()).throw(ImportError(name))
+                    if name == "keyring"
+                    else None
+                )
+                self.assertFalse(main._preflight())
+
+        shown = self._capture_dialog(run)
+        self.assertEqual(len(shown), 1, "the missing dependency was silent")
+        title, message = shown[0]
+        self.assertIn("Missing dependencies", title)
+        self.assertIn("keyring", message)
+        self.assertIn("pip install", message)
+
+    def test_unconfigured_licensing_raises_a_dialog_and_names_the_fix(self) -> None:
+        import main
+        from app.licensing.errors import LicenseConfigurationError
+
+        def run():
+            with unittest.mock.patch.object(
+                main,
+                "_build_manager",
+                side_effect=LicenseConfigurationError("License server URL is invalid"),
+            ):
+                with unittest.mock.patch.object(main, "QApplication", object()):
+                    with unittest.mock.patch.object(
+                        main, "_notify_already_running"
+                    ), unittest.mock.patch.object(main, "_claim_single_instance", return_value=object()):
+                        self.assertEqual(main.main(), 1)
+
+        shown = self._capture_dialog(run)
+        self.assertEqual(len(shown), 1, "the licensing failure was silent")
+        title, message = shown[0]
+        self.assertIn("Licensing is not configured", title)
+        # The user needs the actual remedy, not just a failure.
+        self.assertIn("AI_VOICE_STUDIO_LICENSE_URL", message)
+        self.assertIn("AI_VOICE_STUDIO_LICENSE_PUBLIC_KEYS", message)
+        self.assertIn("License server URL is invalid", message)
+
+    def test_a_data_folder_failure_raises_a_dialog_naming_the_path(self) -> None:
+        import main
+
+        def run():
+            from app.services import file_service
+
+            with unittest.mock.patch.object(
+                main,
+                "_build_manager",
+                return_value=unittest.mock.MagicMock(),
+            ), unittest.mock.patch.object(
+                file_service, "ensure_dirs", side_effect=OSError("Access is denied")
+            ):
+                with unittest.mock.patch.object(main, "QApplication", object()):
+                    with unittest.mock.patch.object(
+                        main, "_notify_already_running"
+                    ), unittest.mock.patch.object(
+                        main, "_claim_single_instance", return_value=object()
+                    ):
+                        self.assertEqual(main.main(), 1)
+
+        shown = self._capture_dialog(run)
+        self.assertEqual(len(shown), 1, "the data folder failure was silent")
+        title, message = shown[0]
+        self.assertIn("data folder", title)
+        self.assertIn("Access is denied", message)
+
+    def test_a_broken_dialog_never_masks_the_real_error(self) -> None:
+        """If Qt cannot show the box, the stderr message must still be there."""
+        import main
+
+        class _Capture:
+            encoding = "utf-8"
+            errors = "backslashreplace"
+
+            def __init__(self) -> None:
+                self.text = ""
+
+            def write(self, data):
+                self.text += data
+
+            def flush(self):
+                return None
+
+        err = _Capture()
+        with unittest.mock.patch.object(sys, "stderr", err):
+            with unittest.mock.patch.object(main, "QApplication", object()):
+                with unittest.mock.patch(
+                    "PyQt5.QtWidgets.QMessageBox.critical",
+                    side_effect=RuntimeError("no display"),
+                ):
+                    # Must not raise: this runs on the failure path, so a second
+                    # exception here would replace a useful error with a
+                    # traceback the user cannot see.
+                    main._startup_failed("Boom", "the details")
+
+        self.assertIn("Boom", err.text)
+        self.assertIn("the details", err.text)
+
+    def test_no_stderr_still_raises_the_dialog(self) -> None:
+        """A detached or closed stderr must not cost the user the message.
+
+        This is the packaged-build case in miniature: if the stream write itself
+        fails, the dialog is the only remaining channel.
+        """
+        import main
+
+        class _Broken:
+            encoding = "utf-8"
+
+            def write(self, _data):
+                raise ValueError("underlying buffer has been detached")
+
+        shown = []
+        with unittest.mock.patch.object(sys, "stderr", _Broken()):
+            with unittest.mock.patch.object(main, "QApplication", object()):
+                with unittest.mock.patch(
+                    "PyQt5.QtWidgets.QMessageBox.critical",
+                    lambda _p, title, message: shown.append((title, message)),
+                ):
+                    main._startup_failed("Boom", "the details")
+
+        self.assertEqual(len(shown), 1)
+        title, message = shown[0]
+        self.assertIn("Boom", title)
+        self.assertEqual(message, "the details")
 
 
 if __name__ == "__main__":

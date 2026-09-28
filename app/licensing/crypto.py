@@ -113,10 +113,37 @@ def parse_time(value: Any) -> datetime:
     if not isinstance(value, str) or not value:
         raise ValueError("Lease timestamp is missing")
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    parsed = datetime.fromisoformat(normalized)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Lease timestamp is not a valid date: {value!r}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        # A UTC offset can push the instant outside the representable range,
+        # e.g. "0001-01-01T00:00:00+10:00". OverflowError is an ArithmeticError,
+        # not a ValueError, so it used to escape the licensing gate as an
+        # unhandled crash -- and because the shipped build has the console
+        # disabled, that killed the app silently on double-click.
+        raise ValueError(f"Lease timestamp is out of range: {value!r}") from exc
+
+
+def _constant_time_equals(left: Any, right: Any) -> bool:
+    """Constant-time string compare that answers False instead of raising.
+
+    ``hmac.compare_digest`` only accepts ``str`` when it is ASCII-only, and
+    raises ``TypeError`` otherwise. A lease whose ``license_key_id`` or
+    ``device_binding`` carries a non-ASCII character therefore crashed the
+    client instead of being rejected. The server only ever emits ASCII ids, so
+    a non-ASCII one means a malformed or tampered response.
+    """
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    if not left.isascii() or not right.isascii():
+        return False
+    return hmac.compare_digest(left, right)
 
 
 def verify_lease(
@@ -151,11 +178,11 @@ def verify_lease(
     for field in ("lease_id", "license_key_id", "activation_id"):
         if not isinstance(payload.get(field), str) or not payload[field]:
             raise ValueError("License response identity is incomplete")
-    if expected_license_key_id is not None and not hmac.compare_digest(
+    if expected_license_key_id is not None and not _constant_time_equals(
         payload["license_key_id"], str(expected_license_key_id)
     ):
         raise ValueError("License response identity does not match")
-    if expected_activation_id is not None and not hmac.compare_digest(
+    if expected_activation_id is not None and not _constant_time_equals(
         payload["activation_id"], str(expected_activation_id)
     ):
         raise ValueError("License response activation does not match")
@@ -179,8 +206,8 @@ def verify_lease(
     if not isinstance(expected_device_id, str) or not expected_device_id:
         raise ValueError("Device identity is missing")
     expected_binding = device_binding(expected_device_id)
-    if not hmac.compare_digest(
-        str(payload.get("device_binding", "")), expected_binding
+    if not _constant_time_equals(
+        payload.get("device_binding", ""), expected_binding
     ):
         raise ValueError("License response is not bound to this device")
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -188,8 +215,16 @@ def verify_lease(
     expires_at = parse_time(payload.get("expires_at"))
     grace_expires_at = parse_time(payload.get("grace_expires_at"))
     server_time = parse_time(payload.get("server_time"))
+    # The response carries its own ``server_time``, and because the payload is
+    # Ed25519-signed that is the one timestamp here no local change can move.
+    # Folding it into "now" is what keeps a machine whose clock runs slow from
+    # reading every single response as "dated in the future" -- which showed a
+    # paying customer an activation dialog that no key could ever satisfy, so
+    # the app could not start at all. It can only push "now" later, never
+    # earlier, so it can never be used to extend a lease.
     if last_server_time is not None:
         current = max(current, last_server_time)
+    current = max(current, server_time)
     if issued_at > current + _MAX_CLOCK_SKEW:
         raise ValueError("License response is dated in the future")
     if grace_expires_at < expires_at:

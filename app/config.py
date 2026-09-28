@@ -139,6 +139,10 @@ QWEN_DEFAULT_REF_VOICE = QWEN_VOICES_DIR / "qwen-default-voice.wav"
 
 # Local (offline) TTS voice models for the optional Piper backend.
 PIPER_VOICE_DIR = MODELS_DIR / "piper-voices"
+# Written once the user has been offered the one-time "download every voice"
+# prefetch, so the app asks a single time instead of on every launch. The Voices
+# screen keeps a button for it either way.
+PIPER_PREFETCH_MARKER = DATA_ROOT / ".piper-prefetch-offered"
 
 # Local (offline) speech-recognition models.
 VOSK_MODEL_DIR = MODELS_DIR / "vosk-models"

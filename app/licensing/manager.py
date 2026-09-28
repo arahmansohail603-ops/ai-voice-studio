@@ -113,12 +113,16 @@ class LicenseManager:
                 expected_license_key_id=state.get("license_key_id"),
                 expected_activation_id=state.get("activation_id"),
             )
-        except LicenseNetworkError:
+        except LicenseNetworkError as exc:
             if self._offline_allowed(state):
                 return state
+            # Chain the cause: a support bundle with only
+            # "The license lease has expired and the server is unavailable"
+            # cannot be told apart from a genuinely expired lease, and this is
+            # the branch that decides whether the user loses the app.
             raise LicenseExpiredError(
                 "The license lease has expired and the server is unavailable"
-            )
+            ) from exc
         except LicenseServerError as exc:
             # The server only issues a fresh lease while the previous one is
             # still inside its grace window. After that it asks for a new

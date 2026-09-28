@@ -566,6 +566,14 @@ class ModelManager:
         """
         spec = self.spec(spec_id)
         with self._download_lock:
+            # Cancelling is a one-way latch on this shared manager, so it has to
+            # be cleared when a *new* attempt starts. Nothing else did: pressing
+            # Cancel once made every later install, for any model, raise
+            # DownloadCancelled before fetching a byte, and the only way out was
+            # restarting the app. Cleared here rather than in the Cancel handler
+            # so the in-flight download is still cancelled -- this line only runs
+            # once the previous attempt has released the download lock.
+            self.reset_cancel()
             self._check_cancel()
             if spec.is_installed(self.models_root) and not force:
                 if not spec.needs_update(self.models_root):
@@ -845,11 +853,44 @@ class ModelManager:
 
             self._write_marker(inner, spec)
             target.parent.mkdir(parents=True, exist_ok=True)
-            _remove(target)
+            # Swap, do not delete-then-move. Removing the old tree first meant a
+            # failure in between -- a slow copy, a full disk, an antivirus lock
+            # -- left the user with no model at all. It also hid its own
+            # failures: _remove swallows them, so if the old tree survived then
+            # inner.replace() raised, and the fallback shutil.move() saw an
+            # existing directory and quietly moved the *new* model inside it.
+            # That reported success while the engine went on loading the stale
+            # top-level files, and the old marker still said the old version, so
+            # the screen never offered the update again.
+            previous = target.with_name(f".{target.name}.previous")
+            _remove(previous)
+            had_previous = False
+            if target.exists():
+                try:
+                    target.replace(previous)
+                    had_previous = True
+                except OSError as exc:
+                    raise ModelError(
+                        f"Could not update '{spec.name}' because its folder is in "
+                        "use by another program. Close anything that has it open "
+                        "and try again."
+                    ) from exc
             try:
-                inner.replace(target)
-            except OSError:
-                shutil.move(str(inner), str(target))
+                try:
+                    inner.replace(target)
+                except OSError:
+                    # Staging can sit on another volume, where rename is not
+                    # allowed, so a copy is the only way in.
+                    shutil.move(str(inner), str(target))
+            except Exception:
+                # Never leave the user with nothing because a swap half-failed.
+                if had_previous and not target.exists():
+                    try:
+                        previous.replace(target)
+                    except OSError:
+                        pass
+                raise
+            _remove(previous)
         except Exception:
             _remove(staging)
             raise

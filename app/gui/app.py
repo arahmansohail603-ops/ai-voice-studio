@@ -25,7 +25,7 @@ from app.core.async_runner import AsyncRunner
 from app.core.errors import module_installed, soft_import
 from app.core.player import AudioPlayer
 from app.core.qwen_cloner import QwenVoiceCloner
-from app.core.recorder import Recorder
+from app.core.recorder import Recorder, default_input_device, device_info
 from app.core.stt_engine import STTEngine
 from app.core.translator import Translator
 from app.core.tts_engine import TTSEngine
@@ -77,6 +77,42 @@ _SUBTITLES = {
 
 
 class VoiceStudioApp(QMainWindow):
+    #: Guards the one-time startup offer. A class-level default so reading it
+    #: never depends on __init__ having run.
+    _prefetch_offer_started = False
+    #: Set when a saved input device had to be replaced at startup, so the
+    #: window can tell the user instead of silently changing a setting.
+    mic_recovery = None
+
+    def _usable_mic_device(self):
+        """The saved microphone, or the default one if the saved one is a speaker.
+
+        Windows lists output endpoints such as "PC Speaker" and "Stereo Mix"
+        among the inputs, and an older build let one of them be saved. Opening
+        such a device fails with MMSYSERR_INVALPARAM (9996) with no useful
+        message, which reads as "the microphone is broken". Recovering here means
+        a machine stuck in that state records again on the next launch, without
+        the user having to know that such a setting exists.
+        """
+        saved = self.settings.get("recorder", "device")
+        if saved is None:
+            return None
+        info = device_info(saved)
+        if info is None or not info.get("is_output"):
+            return saved
+        fallback = default_input_device()
+        if fallback is None:
+            return saved
+        replacement = device_info(fallback) or {}
+        self.settings.set("recorder", "device", fallback)
+        self.mic_recovery = (
+            f"The saved input device '{info['name']}' is a speaker, not a "
+            "microphone, so recording would have failed every time. Switched to "
+            f"'{replacement.get('name', 'the default microphone')}'. You can "
+            "change this under Settings > Microphone."
+        )
+        return fallback
+
     def __init__(self) -> None:
         self._application = QApplication.instance() or QApplication(sys.argv[:1])
         super().__init__()
@@ -104,7 +140,7 @@ class VoiceStudioApp(QMainWindow):
         self.recorder = Recorder(
             samplerate=int(self.settings.get("recorder", "samplerate", 44100)),
             channels=int(self.settings.get("recorder", "channels", 1)),
-            device=self.settings.get("recorder", "device"),
+            device=self._usable_mic_device(),
         )
         self.cloner = VoiceCloner()
         self.qwen_cloner = QwenVoiceCloner()
@@ -149,6 +185,8 @@ class VoiceStudioApp(QMainWindow):
         self._queue_timer.start()
 
         QTimer.singleShot(300, self._background_startup)
+        if self.mic_recovery:
+            QTimer.singleShot(1200, lambda: self.toast(self.mic_recovery, "warn"))
 
     def _build_shell(self) -> None:
         central = QWidget(self)
@@ -303,7 +341,52 @@ class VoiceStudioApp(QMainWindow):
     def _background_startup(self) -> None:
         self._repair_tts_defaults()
         self._prewarm_translation()
-        self.tts.refresh_voices_async(on_done=lambda: None)
+        self.tts.refresh_voices_async(on_done=self._offer_voice_prefetch)
+
+    def _offer_voice_prefetch(self) -> None:
+        """Ask once whether to fetch every Piper voice.
+
+        Two things this has to get right. The catalog is not cached on a fresh
+        install, so reading the cache alone would mean the very first launch --
+        the only launch where the offer matters -- never asks at all; so the
+        catalog is fetched here, in the background, before asking. And this runs
+        as a completion callback on the runner's thread, so the question is
+        marshalled onto the UI thread with schedule(): a QMessageBox built
+        off-thread is undefined behaviour, and it is the first thing a new user
+        sees.
+        """
+        if self._prefetch_offer_started:
+            return
+        self._prefetch_offer_started = True
+
+        from app.gui.screens.voices import prefetch_already_offered
+
+        if prefetch_already_offered():
+            # Already asked (or already installed everything). Do not spend a
+            # network request on the catalog just to decide not to speak.
+            return
+
+        async def warm_then_ask() -> None:
+            from app.core.piper_voices import PiperVoiceLibrary
+
+            try:
+                PiperVoiceLibrary().catalog()
+            except Exception:  # noqa: BLE001 - offline start-up is not an error
+                return
+            self.schedule(self._ask_voice_prefetch)
+
+        try:
+            self.runner.run(warm_then_ask())
+        except Exception:  # noqa: BLE001 - never let this break startup
+            pass
+
+    def _ask_voice_prefetch(self) -> None:
+        from app.gui.screens.voices import offer_bulk_prefetch
+
+        try:
+            offer_bulk_prefetch(self)
+        except Exception:  # noqa: BLE001 - a failed offer must not block startup
+            pass
 
     @staticmethod
     def _prewarm_translation() -> None:
@@ -351,6 +434,11 @@ class VoiceStudioApp(QMainWindow):
         self._closing = True
         if self._current is not None:
             self._screens[self._current].on_hide()
+        for screen in self._screens.values():
+            try:
+                screen.shutdown()
+            except Exception:
+                pass
         try:
             self.runner.stop()
         except Exception:

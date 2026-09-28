@@ -48,6 +48,43 @@ except ImportError:
     QProgressBar = QPushButton = QVBoxLayout = None
 
 
+def _startup_failed(title: str, message: str) -> None:
+    """Report a startup failure on screen, not only on stderr.
+
+    A packaged build has no console (``build.py`` passes ``--noconsole``), so a
+    message written to stderr goes nowhere: the user clicks the shortcut, no
+    window appears, and nothing explains why. Every path that returns 1 before
+    the main window exists has to raise a dialog instead, or the app looks
+    broken rather than unconfigured.
+
+    Degrades to stderr when Qt itself is missing -- that is precisely the
+    preflight case -- and never lets a failure of either channel mask the real
+    error. The two channels are guarded separately on purpose: a packaged build
+    can have a detached stderr, and losing the dialog because the log write
+    failed would reintroduce the exact silent exit this exists to remove.
+    """
+    try:
+        print(f"{config.APP_NAME}: {title}\n\n{message}", file=sys.stderr)
+    except Exception:  # pragma: no cover - stderr can be detached or closed
+        pass
+    if QApplication is None:
+        return
+    try:
+        from PyQt5.QtWidgets import QApplication as _App, QMessageBox
+
+        # A QMessageBox before QApplication exists would abort, so build the
+        # smallest possible one just to carry the message.
+        owns_app = _App.instance() is None
+        app = _App([]) if owns_app else None
+        try:
+            QMessageBox.critical(None, f"{config.APP_NAME} - {title}", message)
+        finally:
+            if app is not None:
+                app.quit()
+    except Exception:  # pragma: no cover - never mask the real error
+        pass
+
+
 def _preflight() -> bool:
     required = (
         ("PyQt5", "PyQt5"),
@@ -62,13 +99,13 @@ def _preflight() -> bool:
             missing.append(package_name)
     if missing:
         packages = " ".join(missing)
-        print(
+        _startup_failed(
+            "Missing dependencies",
             f"{config.APP_NAME} needs {packages} to start.\n\n"
             "Install the dependencies first:\n\n"
             f"    pip install {packages}\n\n"
             "Then run:\n\n"
-            "    python main.py\n",
-            file=sys.stderr,
+            "    python main.py",
         )
         return False
     return True
@@ -675,7 +712,18 @@ def main() -> int:
     try:
         manager = _build_manager()
     except (LicenseConfigurationError, TypeError, ValueError) as exc:
-        print(f"{config.APP_NAME} licensing is not configured: {exc}", file=sys.stderr)
+        _startup_failed(
+            "Licensing is not configured",
+            f"{config.APP_NAME} could not start because its licensing is not set "
+            f"up on this machine.\n\n"
+            f"Details: {exc}\n\n"
+            "This is a packaging setting, not something you did wrong. Set the "
+            "environment variables\n\n"
+            "    AI_VOICE_STUDIO_LICENSE_URL\n"
+            "    AI_VOICE_STUDIO_LICENSE_PUBLIC_KEYS\n\n"
+            "or rebuild with app/_build_license_config.py supplying the server "
+            "URL and the Ed25519 public key.",
+        )
         return 1
 
     from app.services.file_service import ensure_dirs
@@ -683,9 +731,13 @@ def main() -> int:
     try:
         ensure_dirs()
     except OSError as exc:
-        print(
-            f"{config.APP_NAME} could not prepare its data directory: {exc}",
-            file=sys.stderr,
+        _startup_failed(
+            "Cannot prepare the data folder",
+            f"{config.APP_NAME} could not prepare its data directory.\n\n"
+            f"Details: {exc}\n\n"
+            f"It needs to create files under:\n    {getattr(config, 'DATA_DIR', '')}\n\n"
+            "Check that the drive is connected and that you have permission to "
+            "write there.",
         )
         return 1
 

@@ -3,6 +3,8 @@ import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from PyQt5.QtCore import QCoreApplication, QObject
@@ -429,6 +431,19 @@ class LicenseControllerTests(unittest.TestCase):
 
 
 class SingleInstanceTests(unittest.TestCase):
+    def setUp(self):
+        # _single_instance_key() hashes the real DATA_DIR, so against the
+        # default the claim contends with a genuinely running copy of the app:
+        # CreateMutexW succeeds but reports ERROR_ALREADY_EXISTS and the test
+        # fails for anyone who has the app open, which is exactly the situation
+        # this feature exists to handle. Give the test its own data dir so the
+        # mutex name is unique to this process.
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data_dir = patch.object(main.config, "DATA_DIR", Path(tmp.name))
+        data_dir.start()
+        self.addCleanup(data_dir.stop)
+
     def test_only_one_local_server_claim_is_granted(self):
         first = main._claim_single_instance()
         second = main._claim_single_instance()
@@ -438,6 +453,14 @@ class SingleInstanceTests(unittest.TestCase):
         finally:
             if first is not None:
                 first.close()
+
+    def test_the_claim_is_released_so_a_restart_is_not_blocked(self):
+        first = main._claim_single_instance()
+        self.assertIsNotNone(first)
+        first.close()
+        # A crash or a clean exit both have to leave the next launch able to
+        # start; the kernel drops the claim when the handle closes.
+        self.assertIsNotNone(main._claim_single_instance())
 
 
 if __name__ == "__main__":

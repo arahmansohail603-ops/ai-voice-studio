@@ -16,12 +16,15 @@ never leave a half-written ``.onnx`` that Piper would fail to load later.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import shutil
+import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.config import PIPER_VOICE_DIR
@@ -58,11 +61,73 @@ _CHUNK = 256 * 1024
 _MAX_FILE_BYTES = 512 * 1024 * 1024
 _MAX_INDEX_BYTES = 8 * 1024 * 1024
 
+#: Hugging Face throttles anonymous downloads to roughly 1 MB/s, so the full
+#: catalog is a multi-hour transfer. Resuming is therefore not a nicety: without
+#: it a single dropped connection can cost an hour of re-downloading, which is
+#: exactly the "it keeps downloading the same voice again" complaint.
+#: Backoff between attempts to finish one file, in seconds. A connection that
+#: dies mid-transfer is usually transient, so a few patient tries finish the job.
+_RETRY_BACKOFF_SECONDS = (2.0, 6.0, 15.0)
+
 STAGE_DOWNLOADING = "downloading"
 STAGE_VERIFYING = "verifying"
 STAGE_INSTALLED = "installed"
+#: A transfer was interrupted and is about to be retried from where it stopped.
+STAGE_RETRYING = "retrying"
 
 ProgressCallback = Callable[[str, int, int, str], None]
+#: Polled while bytes are moving; return True to stop. Everything already
+#: finished stays on disk, so the next run picks up from the same place.
+CancelCallback = Callable[[], bool]
+
+#: Failures that mean "the connection broke", not "the server said no".
+#: :class:`http.client.IncompleteRead` is the important one: a response that
+#: stops early raises it, and it is neither an :class:`OSError` nor a
+#: :class:`ValueError`, so without it a dropped transfer would escape the resume
+#: logic and lose the partial file.
+_TRANSPORT_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    OSError,
+    ValueError,
+)
+
+
+class _StreamCut(Exception):
+    """The transfer stopped early, but the bytes already on disk are reusable."""
+
+
+class _Aborted(Exception):
+    """The caller asked to stop. Whatever downloaded so far is kept."""
+
+
+@dataclass
+class BulkInstallResult:
+    """What an :meth:`PiperVoiceLibrary.install_all` run achieved."""
+
+    installed: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)
+    cancelled: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed and not self.cancelled
+
+    def summary(self) -> str:
+        if self.cancelled:
+            return f"Stopped after {len(self.installed)} voices."
+        if self.failed:
+            first = self.failed[0]
+            return (
+                f"{len(self.installed)} installed, {len(self.failed)} failed. "
+                f"First failure: {first[0]} -- {first[1]}"
+            )
+        return f"All {len(self.installed) + len(self.skipped)} voices are ready."
+
+
+def _gb(size: int) -> str:
+    return f"{size / (1024 ** 3):.1f}"
 
 
 class VoiceEntry:
@@ -152,14 +217,24 @@ class PiperVoiceLibrary:
 
     def __init__(self, voice_dir: Path | None = None) -> None:
         self.voice_dir = Path(voice_dir or PIPER_VOICE_DIR)
+        # Filename -> md5 for every published asset. Built once: resolving a
+        # digest per file used to re-read and re-scan the whole 245 KB catalog,
+        # which is a few hundred wasted parses over a full prefetch.
+        self._digests: dict[str, str] | None = None
 
     # -------------------------------------------------------------- catalog
     @property
     def index_path(self) -> Path:
         return self.voice_dir / "voices.json"
 
-    def installed(self) -> set[str]:
-        """Stems of the voices already on disk and complete."""
+    def installed(self, snapshot: set[str] | None = None) -> set[str]:
+        """Stems of the voices already on disk and complete.
+
+        Passing an existing snapshot is cheaper than globbing when checking a
+        hundred voices in one pass.
+        """
+        if snapshot is not None:
+            return snapshot
         if not self.voice_dir.is_dir():
             return set()
         found = set()
@@ -172,8 +247,8 @@ class PiperVoiceLibrary:
                 found.add(model.stem)
         return found
 
-    def is_installed(self, entry: VoiceEntry) -> bool:
-        return entry.installed_name() in self.installed()
+    def is_installed(self, entry: VoiceEntry, snapshot: set[str] | None = None) -> bool:
+        return entry.installed_name() in self.installed(snapshot=snapshot)
 
     def _read_cached_index(self) -> dict | None:
         try:
@@ -188,6 +263,7 @@ class PiperVoiceLibrary:
         with open(temp, "w", encoding="utf-8") as handle:
             json.dump(raw, handle)
         os.replace(temp, self.index_path)
+        self._digests = None
 
     def _fetch_index(self) -> dict:
         request = urllib.request.Request(
@@ -197,7 +273,7 @@ class PiperVoiceLibrary:
         try:
             with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
                 raw = response.read(_MAX_INDEX_BYTES + 1)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except _TRANSPORT_ERRORS as exc:
             raise NetworkError(
                 f"Could not reach the Piper voice catalog: {exc}"
             ) from exc
@@ -339,38 +415,72 @@ class PiperVoiceLibrary:
         self,
         entry: VoiceEntry,
         on_progress: ProgressCallback | None = None,
+        should_cancel: CancelCallback | None = None,
+        snapshot: set[str] | None = None,
     ) -> Path:
         """Download and verify a voice. Returns the installed ``.onnx`` path.
 
         Already-complete voices return immediately, so a retried download costs
-        nothing.
+        nothing, and each file is checked on its own: a voice whose model landed
+        but whose config did not is finished off with just the config instead of
+        re-fetching the whole model.
         """
-        if self.is_installed(entry):
+        if self.is_installed(entry, snapshot):
             return self.voice_dir / f"{entry.installed_name()}.onnx"
 
-        wanted = [(p, p.endswith(".onnx")) for p in entry.files
-                  if p.endswith((".onnx", ".onnx.json"))]
+        wanted = [p for p in entry.files if p.endswith((".onnx", ".onnx.json"))]
         if not wanted:
             raise TTSGenerationError(
                 f"The catalog entry for '{entry.key}' lists no downloadable files."
             )
-        total = sum(entry._size(p) for p, _ in wanted)
         self.voice_dir.mkdir(parents=True, exist_ok=True)
 
+        def needed(remote: str) -> bool:
+            return not self._is_complete(
+                self.voice_dir / Path(remote).name, entry._size(remote)
+            )
+
+        # Config first, model second: a voice without its config is not
+        # speakable, whereas the model on its own is harmless.
+        pending = sorted(wanted, key=lambda p: p.endswith(".onnx"))
+        pending = [p for p in pending if needed(p)]
+        total = sum(entry._size(p) for p in pending)
+
         received = 0
-        for remote, is_model in sorted(wanted, key=lambda item: not item[1]):
+        for remote in pending:
+            size = entry._size(remote)
             self._fetch_file(
                 remote,
                 self.voice_dir / Path(remote).name,
-                entry._size(remote),
+                size,
                 on_progress,
                 received=received,
                 total=total,
+                should_cancel=should_cancel,
             )
-            received += entry._size(remote)
+            received += size
         if on_progress:
             on_progress(STAGE_INSTALLED, total, total, entry.installed_name())
         return self.voice_dir / f"{entry.installed_name()}.onnx"
+
+    def _is_complete(self, destination: Path, expected_bytes: int) -> bool:
+        """True when *destination* already holds the bytes the catalog promised.
+
+        This is what makes a prefetch idempotent: without it, re-running a
+        download would refetch gigabytes that are already correct on disk.
+        """
+        try:
+            size = destination.stat().st_size
+        except OSError:
+            return False
+        if size == 0:
+            return False
+        if expected_bytes and size != expected_bytes:
+            return False
+        expected_md5 = self._expected_md5(destination.name)
+        if expected_md5 and self._md5(destination) != expected_md5:
+            return False
+        return True
 
     def _fetch_file(
         self,
@@ -380,28 +490,166 @@ class PiperVoiceLibrary:
         on_progress: ProgressCallback | None,
         received: int = 0,
         total: int = 0,
+        should_cancel: CancelCallback | None = None,
     ) -> None:
-        """Stream one file, verify it, then move it into place atomically."""
+        """Stream one file, verify it, then move it into place atomically.
+
+        A transfer that dies part-way keeps its ``.part`` file and is resumed
+        with a Range request, because at the throttled speed this server
+        delivers, starting over can mean another hour for one voice.
+        """
         if expected_bytes > _MAX_FILE_BYTES:
             raise TTSGenerationError(
                 f"'{destination.name}' is implausibly large "
                 f"({expected_bytes} bytes); refusing to download it."
             )
-        url = _FILE_BASE + remote
-        request = urllib.request.Request(url, headers={"User-Agent": self._user_agent()})
+        if self._is_complete(destination, expected_bytes):
+            return
+
+        self.voice_dir.mkdir(parents=True, exist_ok=True)
         temp = destination.with_name(destination.name + ".part")
-        got = 0
+        attempts = len(_RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            have = self._resumable_size(temp, expected_bytes)
+            try:
+                got = self._stream(
+                    remote, temp, destination.name, expected_bytes,
+                    on_progress, received, total, have, should_cancel,
+                )
+            except (_Aborted, _StreamCut) as exc:
+                if isinstance(exc, _Aborted) or attempt >= attempts - 1:
+                    if isinstance(exc, _StreamCut):
+                        raise NetworkError(
+                            f"Could not download '{destination.name}': {exc}"
+                        ) from exc
+                    raise
+                # Keep the partial file and pick up where it stopped.
+                landed = self._resumable_size(temp, expected_bytes)
+                if on_progress:
+                    on_progress(
+                        STAGE_RETRYING, received + landed,
+                        total or expected_bytes, destination.name,
+                    )
+                self._wait_before_retry(attempt, should_cancel)
+                continue
+            except NetworkError:
+                if attempt >= attempts - 1:
+                    raise
+                if on_progress:
+                    on_progress(
+                        STAGE_RETRYING, received + have,
+                        total or expected_bytes, destination.name,
+                    )
+                self._wait_before_retry(attempt, should_cancel)
+                continue
+
+            # The stream ended on its own, so any size or digest mismatch is a
+            # fact about the server rather than a dropped connection: fail
+            # without retrying, and do not leave the stub behind.
+            if expected_bytes and got != expected_bytes:
+                temp.unlink(missing_ok=True)
+                raise TTSGenerationError(
+                    f"'{destination.name}' was {got} bytes but the catalog says "
+                    f"{expected_bytes}. The download was incomplete."
+                )
+            if on_progress:
+                on_progress(
+                    STAGE_VERIFYING, received + got, total or got, destination.name
+                )
+            self._verify(temp, destination)
+            os.replace(temp, destination)
+            return
+
+    @staticmethod
+    def _wait_before_retry(attempt: int, should_cancel: CancelCallback | None) -> None:
+        """Pause before retrying, in slices, so Stop stays responsive."""
+        remaining = _RETRY_BACKOFF_SECONDS[attempt]
+        while remaining > 0:
+            if should_cancel and should_cancel():
+                raise _Aborted()
+            nap = min(0.25, remaining)
+            time.sleep(nap)
+            remaining -= nap
+
+    def _resumable_size(self, temp: Path, expected_bytes: int) -> int:
+        """Bytes already on disk that a Range request can continue from."""
+
         try:
-            with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-                with open(temp, "wb") as sink:
+            have = temp.stat().st_size
+        except OSError:
+            return 0
+        if expected_bytes and have >= expected_bytes:
+            # A partial at or past the published size cannot be continued. Either
+            # a previous attempt appended something wrong or the server moved;
+            # either way, start this file again.
+            temp.unlink(missing_ok=True)
+            return 0
+        return have
+
+    def _stream(
+        self,
+        remote: str,
+        temp: Path,
+        label: str,
+        expected_bytes: int,
+        on_progress: ProgressCallback | None,
+        received: int,
+        total: int,
+        have: int,
+        should_cancel: CancelCallback | None,
+    ) -> int:
+        """Pull one file into *temp*, returning how many bytes the file now has."""
+        url = _FILE_BASE + remote
+        headers = {"User-Agent": self._user_agent()}
+        resuming = have > 0
+        if resuming:
+            headers["Range"] = f"bytes={have}-"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            response = urllib.request.urlopen(request, timeout=_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416 and resuming:
+                # Our partial is past the end of the real file: drop it and
+                # fetch this file from the beginning.
+                temp.unlink(missing_ok=True)
+                return self._stream(
+                    remote, temp, label, expected_bytes, on_progress,
+                    received, total, 0, should_cancel,
+                )
+            raise NetworkError(
+                f"Could not download '{label}': the server replied "
+                f"HTTP {exc.code} {exc.reason}"
+            ) from exc
+        except _TRANSPORT_ERRORS as exc:
+            raise _StreamCut(exc) from exc
+
+        got = have
+        try:
+            with response:
+                status = getattr(response, "status", None) or response.getcode()
+                if resuming and status != 206:
+                    # The server ignored the Range header and is sending the whole
+                    # file again. Appending to what we have would corrupt it.
+                    got = 0
+                    mode = "wb"
+                else:
+                    mode = "ab" if resuming else "wb"
+                # read1() rather than read(): read(n) is happy to return fewer
+                # bytes than it promised without complaining, so a body that
+                # stops early looks like a clean end-of-file. What is still owed
+                # is checked below instead.
+                read1 = getattr(response, "read1", None) or response.read
+                with open(temp, mode) as sink:
                     while True:
-                        chunk = response.read(_CHUNK)
+                        if should_cancel and should_cancel():
+                            raise _Aborted()
+                        chunk = read1(_CHUNK)
                         if not chunk:
                             break
                         got += len(chunk)
                         if got > _MAX_FILE_BYTES:
                             raise TTSGenerationError(
-                                f"'{destination.name}' downloaded far larger than "
+                                f"'{label}' downloaded far larger than "
                                 "expected; the download was stopped."
                             )
                         sink.write(chunk)
@@ -410,27 +658,26 @@ class PiperVoiceLibrary:
                                 STAGE_DOWNLOADING,
                                 received + got,
                                 total or expected_bytes,
-                                destination.name,
+                                label,
                             )
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            temp.unlink(missing_ok=True)
-            raise NetworkError(
-                f"Could not download '{destination.name}': {exc}"
-            ) from exc
-        except Exception:
-            temp.unlink(missing_ok=True)
+                owed = getattr(response, "length", None)
+                if owed:
+                    # The server had more to send and the connection ended
+                    # anyway. That is a dropped transfer, not a short file, so
+                    # the bytes already written are kept and resumed. This is
+                    # the common shape of failure behind a CDN or proxy.
+                    raise _StreamCut(
+                        f"the connection closed with {owed} bytes still to send"
+                    )
+        except _Aborted:
             raise
-
-        if expected_bytes and got != expected_bytes:
-            temp.unlink(missing_ok=True)
-            raise TTSGenerationError(
-                f"'{destination.name}' was {got} bytes but the catalog says "
-                f"{expected_bytes}. The download was incomplete."
-            )
-        if on_progress:
-            on_progress(STAGE_VERIFYING, received + got, total or got, destination.name)
-        self._verify(temp, destination)
-        os.replace(temp, destination)
+        except TTSGenerationError:
+            raise
+        except _TRANSPORT_ERRORS as exc:
+            # The connection died mid-file. The bytes written so far are valid,
+            # so keep them and let the caller resume.
+            raise _StreamCut(exc) from exc
+        return got
 
     def _verify(self, temp: Path, destination: Path) -> None:
         """Confirm the bytes are what the catalog promised, then publish."""
@@ -447,13 +694,18 @@ class PiperVoiceLibrary:
             raise TTSGenerationError(f"'{destination.name}' downloaded empty.")
 
     def _expected_md5(self, filename: str) -> str | None:
-        raw = self._read_cached_index() or {}
-        for item in raw.values():
-            for remote, meta in (item.get("files") or {}).items():
-                if Path(remote).name == filename and isinstance(meta, dict):
+        if self._digests is None:
+            digests: dict[str, str] = {}
+            for item in (self._read_cached_index() or {}).values():
+                for remote, meta in (item.get("files") or {}).items():
+                    if not isinstance(meta, dict):
+                        continue
                     digest = meta.get("md5_digest")
-                    return str(digest) if digest else None
-        return None
+                    # First writer wins, matching the old linear scan.
+                    if digest and Path(remote).name not in digests:
+                        digests[Path(remote).name] = str(digest)
+            self._digests = digests
+        return self._digests.get(filename)
 
     @staticmethod
     def _md5(path: Path) -> str:
@@ -462,6 +714,95 @@ class PiperVoiceLibrary:
             for chunk in iter(lambda: handle.read(_CHUNK), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    def _missing_bytes(self, entry: VoiceEntry) -> int:
+        """Bytes still needed before *entry* is complete and usable."""
+        total = 0
+        for remote in entry.files:
+            if not remote.endswith((".onnx", ".onnx.json")):
+                continue
+            if not self._is_complete(
+                self.voice_dir / Path(remote).name, entry._size(remote)
+            ):
+                total += entry._size(remote)
+        return total
+
+    # --------------------------------------------------------- bulk prefetch
+    def install_all(
+        self,
+        entries: Iterable[VoiceEntry] | None = None,
+        on_progress: ProgressCallback | None = None,
+        should_cancel: CancelCallback | None = None,
+        free_bytes: int | None = None,
+    ) -> BulkInstallResult:
+        """Install every published voice, skipping whatever is already there.
+
+        One voice failing does not abandon the other hundred and seventy, and
+        stopping part-way keeps every voice finished so far: re-running this
+        costs nothing and continues from the first missing file.
+        """
+        pool = list(self.catalog() if entries is None else entries)
+        if not pool:
+            raise NetworkError(
+                "The Piper voice catalog is empty, so there is nothing to download."
+            )
+        self.voice_dir.mkdir(parents=True, exist_ok=True)
+
+        result = BulkInstallResult()
+        known = self.installed()
+        plan: list[tuple[VoiceEntry, int]] = []
+        for entry in pool:
+            if self.is_installed(entry, known):
+                result.skipped.append(entry.installed_name())
+            else:
+                plan.append((entry, self._missing_bytes(entry)))
+        if not plan:
+            return result
+
+        grand_total = sum(need for _, need in plan)
+        if free_bytes is None:
+            try:
+                free_bytes = shutil.disk_usage(self.voice_dir).free
+            except OSError:
+                free_bytes = None
+        if free_bytes is not None and free_bytes < grand_total:
+            raise TTSGenerationError(
+                f"Downloading every voice needs {_gb(grand_total)} GB of free disk "
+                f"space, but only {_gb(free_bytes)} GB is available. Free up some "
+                "space, or install the languages you actually need from the "
+                "Voices screen."
+            )
+
+        done = 0
+        for index, (entry, need) in enumerate(plan, start=1):
+            if should_cancel and should_cancel():
+                result.cancelled = True
+                break
+
+            def report(stage: str, got: int, _total: int, _label: str,
+                       _done: int = done, _entry: VoiceEntry = entry,
+                       _index: int = index) -> None:
+                if on_progress:
+                    on_progress(
+                        stage,
+                        _done + got,
+                        grand_total,
+                        f"{_entry.installed_name()} ({_index}/{len(plan)})",
+                    )
+
+            try:
+                self.install(entry, on_progress=report,
+                             should_cancel=should_cancel, snapshot=known)
+            except _Aborted:
+                result.cancelled = True
+                break
+            except AppError as exc:
+                result.failed.append((entry.installed_name(), str(exc)))
+            else:
+                result.installed.append(entry.installed_name())
+                done += need
+                known = self.installed()
+        return result
 
     def remove(self, entry: VoiceEntry) -> None:
         """Delete an installed voice and its config."""
@@ -481,6 +822,7 @@ class PiperVoiceLibrary:
             self.index_path.unlink(missing_ok=True)
         except OSError:
             pass
+        self._digests = None
 
     def disk_usage(self) -> int:
         total = 0
@@ -493,6 +835,25 @@ class PiperVoiceLibrary:
         except OSError:
             return 0
         return total
+
+    def remaining(self, entries: Iterable[VoiceEntry] | None = None) -> tuple[int, int]:
+        """``(voices still to fetch, bytes still to fetch)`` for the whole catalog.
+
+        Used by the UI to label the bulk button honestly rather than promising
+        a download that is already on disk.
+        """
+        pool = list(self.catalog_from_cache() if entries is None else entries)
+        if not pool:
+            return 0, 0
+        known = self.installed()
+        count = 0
+        total = 0
+        for entry in pool:
+            if self.is_installed(entry, known):
+                continue
+            count += 1
+            total += self._missing_bytes(entry)
+        return count, total
 
     @staticmethod
     def _user_agent() -> str:

@@ -19,18 +19,30 @@ def ensure_dirs() -> None:
 
 
 def set_output_root(new_root: str | Path) -> None:
-    """Point all category folders at a new root (persisted by caller)."""
+    """Point all category folders at a new root (persisted by caller).
+
+    The tree is built before ``config`` is repointed, so a root that cannot be
+    created -- a path with a file in the way, a disconnected drive, a full disk
+    -- leaves the previous root in charge. The assignment used to run first, so
+    a failure midway left every category pointing at a directory that did not
+    exist for the rest of the session.
+
+    The ``OSError`` is still raised for the caller to report. It must not be
+    raised from inside a Qt slot: PyQt5's default handler answers an unhandled
+    exception with ``qFatal()``, which aborts the process.
+    """
     root = Path(new_root).resolve()
-    config.OUTPUT_DIR = root
-    root.mkdir(parents=True, exist_ok=True)
-    config.OUTPUT_SUBDIRS = {
+    subdirs = {
         "tts": root / "tts",
         "recordings": root / "recordings",
         "transcripts": root / "transcripts",
         "voices": root / "voices",
         "clones": root / "clones",
     }
-    ensure_dirs()
+    for path in subdirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    config.OUTPUT_DIR = root
+    config.OUTPUT_SUBDIRS = subdirs
 
 
 def category_dir(category: str) -> Path:

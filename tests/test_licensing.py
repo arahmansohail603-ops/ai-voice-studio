@@ -42,6 +42,7 @@ class LicensingTests(unittest.TestCase):
         expires_offset=3600,
         grace_offset=3900,
         server_offset=0,
+        payload_overrides=None,
     ):
         payload = {
             "activation_id": "activation-1",
@@ -63,6 +64,8 @@ class LicensingTests(unittest.TestCase):
             "valid": True,
             "version": 1,
         }
+        if payload_overrides:
+            payload.update(payload_overrides)
         signature = self.private_key.sign(canonical_json(payload).encode("utf-8"))
         return {
             "algorithm": "Ed25519",
@@ -246,6 +249,204 @@ class LicensingTests(unittest.TestCase):
                 now=lambda: self.now,
             )
             self.assertEqual(manager.refresh(), state)
+
+
+class MalformedLeaseTests(unittest.TestCase):
+    """A hostile or buggy server must be rejected, never crash the app.
+
+    ``main.start()`` catches only ``(LicenseError, RuntimeError, ValueError)``.
+    A ``TypeError`` or ``OverflowError`` escaping ``verify_lease`` therefore
+    propagated out of ``main()`` -- and the shipped build has the console
+    disabled, so a customer double-clicking the executable got no window, no
+    dialog and no message, just a process that died. Each case below is a real
+    way a value like that reaches a signed payload.
+    """
+
+    def setUp(self):
+        self.private_key = Ed25519PrivateKey.generate()
+        public_bytes = self.private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.public_keys = {"test-v1": public_bytes}
+        self.now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def _verify(self, payload_overrides, **kwargs):
+        payload = {
+            "activation_id": "activation-1",
+            "client_metadata": {},
+            "device_binding": device_binding("device-a"),
+            "entitlements": {},
+            "expires_at": (self.now + timedelta(seconds=3600)).isoformat(),
+            "grace_expires_at": (self.now + timedelta(seconds=3900)).isoformat(),
+            "grace_duration_seconds": 300,
+            "issued_at": self.now.isoformat(),
+            "lease_duration_seconds": 3600,
+            "lease_id": "lease-1",
+            "license_key_id": "license-1",
+            "server_time": self.now.isoformat(),
+            "state": "active",
+            "type": "license_lease",
+            "valid": True,
+            "version": 1,
+        }
+        payload.update(payload_overrides)
+        signature = self.private_key.sign(canonical_json(payload).encode("utf-8"))
+        envelope = {
+            "algorithm": "Ed25519",
+            "encoding": "canonical-json",
+            "key_id": "test-v1",
+            "payload": payload,
+            "signature": base64.urlsafe_b64encode(signature)
+            .decode("ascii")
+            .rstrip("="),
+        }
+        return verify_lease(
+            envelope, self.public_keys, "device-a", now=self.now, **kwargs
+        )
+
+    def test_non_ascii_license_key_id_is_rejected(self):
+        # hmac.compare_digest raises TypeError on non-ASCII str.
+        with self.assertRaises(ValueError):
+            self._verify(
+                {"license_key_id": "licéns"}, expected_license_key_id="licéns"
+            )
+
+    def test_non_ascii_activation_id_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._verify({"activation_id": "aé"}, expected_activation_id="aé")
+
+    def test_non_ascii_device_binding_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._verify({"device_binding": "dév"})
+
+    def test_out_of_range_utc_offset_is_rejected(self):
+        # The offset pushes the instant below datetime.min, and OverflowError
+        # is an ArithmeticError, not a ValueError.
+        for value in ("0001-01-01T00:00:00+10:00", "9999-12-31T23:59:59-10:00"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self._verify({"expires_at": value})
+
+    def test_unparseable_timestamp_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._verify({"expires_at": "not-a-date"})
+
+    def test_a_slow_local_clock_does_not_lock_out_a_valid_lease(self):
+        """A machine running behind must still be able to start the app.
+
+        Every field here is signed, so the response is exactly what the server
+        sent; only this machine's clock is wrong. The check that rejected it
+        compared a server-issued timestamp against a local clock nobody in the
+        app controls, so a slow clock made every response look "dated in the
+        future" and the activation dialog could never be satisfied.
+        """
+        for behind in (6 * 60, 2 * 3600, 24 * 3600):
+            with self.subTest(seconds_behind=behind):
+                verified = verify_lease(
+                    self._envelope_for_clock(),
+                    self.public_keys,
+                    "device-a",
+                    now=self.now - timedelta(seconds=behind),
+                )
+                self.assertEqual(verified["state"], "active")
+
+    def _envelope_for_clock(self, server_offset=0):
+        payload = {
+            "activation_id": "activation-1",
+            "client_metadata": {},
+            "device_binding": device_binding("device-a"),
+            "entitlements": {},
+            "expires_at": (self.now + timedelta(seconds=3600)).isoformat(),
+            "grace_expires_at": (self.now + timedelta(seconds=3900)).isoformat(),
+            "grace_duration_seconds": 300,
+            "issued_at": self.now.isoformat(),
+            "lease_duration_seconds": 3600,
+            "lease_id": "lease-1",
+            "license_key_id": "license-1",
+            "server_time": (self.now + timedelta(seconds=server_offset)).isoformat(),
+            "state": "active",
+            "type": "license_lease",
+            "valid": True,
+            "version": 1,
+        }
+        signature = self.private_key.sign(canonical_json(payload).encode("utf-8"))
+        return {
+            "algorithm": "Ed25519",
+            "encoding": "canonical-json",
+            "key_id": "test-v1",
+            "payload": payload,
+            "signature": base64.urlsafe_b64encode(signature)
+            .decode("ascii")
+            .rstrip("="),
+        }
+
+    def test_a_slow_clock_still_cannot_extend_an_expired_lease(self):
+        """Anchoring on the signed server_time must not become a free extension.
+
+        Here the response's own signed ``server_time`` already sits past the
+        lease's grace deadline, so the server is saying the lease is over. A
+        local clock rolled back a year must not talk the client out of that:
+        before the fix the deadline was compared against the local clock only,
+        so a machine running slow accepted a lease the server had ended.
+        """
+        envelope = self._envelope_for_clock(server_offset=4000)
+        with self.assertRaises(LicenseExpiredError):
+            verify_lease(
+                envelope,
+                self.public_keys,
+                "device-a",
+                now=self.now - timedelta(days=365),
+            )
+
+
+class KeystoreFailureTests(unittest.TestCase):
+    """A broken keystore must not be reported as a tampered license store."""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.path = f"{self.directory.name}/license.dat"
+        EncryptedLicenseStore(self.path, key_provider=lambda: b"k" * 32).save(
+            {"version": 1, "license_key": "LIC-1", "device_id": "device-a"}
+        )
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_unavailable_keystore_keeps_its_own_message(self):
+        def broken():
+            raise LicenseConfigurationError(
+                "The operating-system keystore is unavailable"
+            )
+
+        store = EncryptedLicenseStore(self.path, key_provider=broken)
+        with self.assertRaises(LicenseConfigurationError):
+            store.load()
+
+    def test_a_short_key_is_a_keystore_problem_not_tampering(self):
+        store = EncryptedLicenseStore(self.path, key_provider=lambda: b"too short")
+        with self.assertRaises(LicenseConfigurationError):
+            store.load()
+
+    def test_load_and_save_agree_when_the_keystore_is_down(self):
+        """The two halves of the same store must name the same failure.
+
+        Reporting "missing or has been modified" from load() sent the user to
+        delete license.dat, which then made save() fail with the real message
+        instead -- an unwinnable loop.
+        """
+
+        def broken():
+            raise RuntimeError("no keyring backend")
+
+        loaded = EncryptedLicenseStore(self.path, key_provider=broken)
+        with self.assertRaises(Exception) as load_context:
+            loaded.load()
+        with self.assertRaises(Exception) as save_context:
+            loaded.save({"version": 1})
+        self.assertEqual(
+            type(load_context.exception), type(save_context.exception)
+        )
 
 
 if __name__ == "__main__":

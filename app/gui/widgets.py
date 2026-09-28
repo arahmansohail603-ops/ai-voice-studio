@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import functools
+import sys
+import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
+from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
@@ -20,10 +24,113 @@ from PyQt5.QtWidgets import (
 from app.gui import theme
 
 
+#: Where a crash traceback is written. A shipped build runs with --noconsole,
+#: so stderr goes nowhere and a slot that aborts leaves the user with nothing
+#: but a vanished window.
+ERROR_LOG = None
+
+
+def _error_log_path():
+    global ERROR_LOG
+    if ERROR_LOG is None:
+        try:
+            from app.config import DATA_ROOT
+
+            ERROR_LOG = DATA_ROOT / "app-errors.log"
+        except Exception:  # noqa: BLE001 - never fail because of logging
+            ERROR_LOG = Path("app-errors.log")
+    return ERROR_LOG
+
+
+def log_exception(context: str, exc_info) -> str:
+    """Append a traceback to the error log and return a one-line summary."""
+    exc_type, exc, tb = exc_info
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    try:
+        path = _error_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n===== {datetime.now().isoformat(timespec='seconds')} {context} =====\n"
+            )
+            handle.write(text)
+    except Exception:  # noqa: BLE001 - logging must never raise
+        pass
+    return f"{exc_type.__name__}: {exc}"
+
+
+def ui_slot(func):
+    """Run a Qt slot without letting an exception take the process down.
+
+    PyQt5 reacts to an exception escaping a slot by calling ``qFatal()``, which
+    aborts immediately and shows nothing. A packaged build has no console, so
+    the user just sees the app disappear mid-download and has no way to report
+    what happened. This is how the "app crashes when I press Download" class of
+    bug stays invisible: the real fault only exists as a Windows event-log entry
+    naming a DLL. Catching here turns a silent death into a message on screen
+    plus a traceback on disk.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - the whole point is to survive
+            try:
+                _report_slot_failure(args[0] if args else None, func)
+            except Exception:  # noqa: BLE001
+                # Reporting failed too: the disk may be full, the data folder
+                # unwritable, the widget half-deleted. Raising from here would
+                # abort the process from inside its own error path, so give up
+                # quietly rather than trade one crash for a worse one.
+                pass
+            return None
+
+    return wrapper
+
+
+def _report_slot_failure(receiver, func) -> None:
+    """Log a slot failure and try to tell the user. May itself fail."""
+    summary = log_exception(f"{func.__module__}.{func.__qualname__}", sys.exc_info())
+    if receiver is None:
+        return
+    for name in ("_show_message", "set_status"):
+        handler = getattr(receiver, name, None)
+        if not callable(handler):
+            continue
+        try:
+            if name == "_show_message":
+                handler(f"Something went wrong: {summary}", theme.DANGER)
+            else:
+                handler(None, f"Something went wrong: {summary}")
+            return
+        except Exception:  # noqa: BLE001 - fall through to the next hook
+            continue
+
+
 def fmt_clock(seconds: float) -> str:
     seconds = max(0, int(seconds))
     minutes, secs = divmod(seconds, 60)
     return f"{minutes:02d}:{secs:02d}"
+
+
+#: Progress bars work in a bounded 0..PROGRESS_SCALE range rather than in bytes.
+#:
+#: QProgressBar.setRange takes a C++ ``int``, so any byte total above
+#: 2**31-1 (~2.1 GB) raises OverflowError. The full Piper catalog is ~11 GB, and
+#: a multi-GB TTS model is just as capable of crossing the line. That
+#: OverflowError is raised inside a Qt slot, and PyQt5 turns an unhandled
+#: exception in a slot into ``qFatal()`` -> ``abort()``: the whole app dies with
+#: no error shown. Expressing progress as a fraction removes the ceiling
+#: entirely, and reads the same for a 4 MB voice and an 11 GB catalog.
+PROGRESS_SCALE = 1000
+
+
+def progress_value(received: int, total: int) -> int:
+    """Map a byte count onto the 0..PROGRESS_SCALE bar range, clamped."""
+    if total <= 0:
+        return 0
+    return max(0, min(PROGRESS_SCALE, int(received * PROGRESS_SCALE / total)))
 
 
 def bind_future(
@@ -163,6 +270,17 @@ class BusyButton(QPushButton):
         self.setEnabled(not busy)
         self.setText((running_text or "Working…") if busy else self._rest_text)
 
+    def set_idle_text(self, text: str) -> None:
+        """Change the resting label without disabling the button.
+
+        ``set_busy(True)`` greys the button out, which is wrong for a toggle the
+        user has to press a second time to stop. This swaps the label and keeps
+        the button clickable, and ``set_busy(False)`` still restores it.
+        """
+        self._rest_text = text
+        if not getattr(self, "_busy", False):
+            self.setText(text)
+
     @property
     def busy(self) -> bool:
         return getattr(self, "_busy", False)
@@ -289,7 +407,10 @@ class AudioPlayerBar(QFrame):
         self._timer = QTimer(self)
         self._timer.setInterval(200)
         self._timer.timeout.connect(self._poll)
-        self._timer.start()
+        # Started in set_file, not here. All nine screens are built eagerly at
+        # startup, so starting in __init__ meant three of these bars polling 15
+        # times a second for the whole process lifetime, on hidden screens, with
+        # no file loaded. clear() stops it again.
 
     @staticmethod
     def _value(obj, name: str, default=0):
@@ -304,10 +425,12 @@ class AudioPlayerBar(QFrame):
             f"00:00 / {fmt_clock(self._value(self.player, 'duration'))}"
         )
         self._slider.setValue(0)
+        self._timer.start()
         if autoplay:
             self.player.play()
 
     def clear(self) -> None:
+        self._timer.stop()
         if self._file is not None and self._same_path(
             self._value(self.player, "path"), self._file
         ):
@@ -395,6 +518,15 @@ class Screen(QWidget):
         return None
 
     def on_hide(self) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        """Called once when the app is closing.
+
+        Separate from :meth:`on_hide` because a long job must survive the user
+        switching tabs, but must not outlive the process: a QThread still
+        running when its widget is destroyed takes the process down with it.
+        """
         return None
 
     def set_status(

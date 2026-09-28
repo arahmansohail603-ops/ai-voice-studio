@@ -90,7 +90,19 @@ class EncryptedLicenseStore:
         return self.path.is_file()
 
     def _key(self) -> bytes:
-        key = self._key_provider()
+        try:
+            key = self._key_provider()
+        except LicenseConfigurationError:
+            raise
+        except Exception as exc:
+            # A keystore that cannot be reached is a configuration problem, not
+            # a damaged store, and load() and save() have to say the same thing
+            # about it. Normalised here so both callers report it identically
+            # and neither leaks a bare provider error to the activation dialog.
+            raise LicenseConfigurationError(
+                "The operating-system keystore is unavailable; "
+                "license storage cannot be protected"
+            ) from exc
         if not isinstance(key, bytes) or len(key) != 32:
             raise LicenseConfigurationError(
                 "The license keystore returned an invalid key"
@@ -119,10 +131,19 @@ class EncryptedLicenseStore:
                 raise ValueError("file hash does not match")
             nonce = raw[nonce_offset:cipher_offset]
             ciphertext = raw[cipher_offset:]
+            # Resolved before the decrypt handler on purpose. A keystore that is
+            # unavailable, or that returned a key of the wrong length, raises
+            # LicenseConfigurationError("...keystore..."), which is actionable.
+            # Inside the handler below it was swallowed by the broad except and
+            # rewritten as "the store is missing or has been modified" -- which
+            # points the user at deleting license.dat, the exact wrong remedy,
+            # and contradicts save(), which reports the real cause for the same
+            # broken keystore.
+            key = self._key()
             try:
                 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-                plaintext = AESGCM(self._key()).decrypt(nonce, ciphertext, _MAGIC)
+                plaintext = AESGCM(key).decrypt(nonce, ciphertext, _MAGIC)
             except ImportError as exc:
                 raise LicenseConfigurationError(
                     "cryptography is required to read the local license store"

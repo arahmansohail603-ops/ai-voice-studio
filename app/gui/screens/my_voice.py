@@ -21,9 +21,21 @@ from app.config import language_display_name
 from app.core import audio_utils
 from app.core.piper_voices import PiperVoiceLibrary
 from app.core.qwen_cloner import QwenVoiceCloner
-from app.core.voice_cloner import CloneState, VoiceCloner
+from app.core.voice_cloner import (
+    MAX_SAMPLE_SECONDS,
+    MIN_SAMPLE_SECONDS,
+    CloneState,
+    VoiceCloner,
+)
 from app.gui import theme
-from app.gui.widgets import AudioPlayerBar, BusyButton, MethodBadge, Screen, TextEdit
+from app.gui.widgets import (
+    AudioPlayerBar,
+    BusyButton,
+    MethodBadge,
+    MicLevelMeter,
+    Screen,
+    TextEdit,
+)
 from app.services import file_service
 
 _ENGINE_LABELS = {
@@ -55,6 +67,9 @@ class MyVoiceScreen(Screen):
         self.profile_path: Path | None = None
         self._last_result = None
         self._ref_tracking = False
+        # True once the reference recording has actually seen sound, so the
+        # screen can tell a working microphone from a silent one mid-take.
+        self._ref_peak_seen = False
         self._ref_track_timer = QTimer(self)
         self._ref_track_timer.setInterval(100)
         self._ref_track_timer.timeout.connect(self._ref_tick)
@@ -125,11 +140,14 @@ class MyVoiceScreen(Screen):
         )
         source_button_layout = QHBoxLayout(source_buttons)
         source_button_layout.setContentsMargins(0, 0, 0, 0)
+        # One button does the whole job: press it, talk, and the take stops and
+        # loads itself at MAX_SAMPLE_SECONDS. A separate Stop button meant two
+        # clicks plus a timer the user had to watch and stop by hand.
         self.ref_record_btn = BusyButton(
             source_buttons,
-            text="Record Sample",
+            text="Record & Use",
             command=self._toggle_ref_record,
-            width=130,
+            width=160,
             height=34,
             font=theme.font(13, "bold"),
             fg_color=theme.ACCENT,
@@ -137,15 +155,17 @@ class MyVoiceScreen(Screen):
             text_color=theme.ON_ACCENT,
         )
         source_button_layout.addWidget(self.ref_record_btn)
-        self.ref_stop_btn = QPushButton("Stop", source_buttons)
-        self._style_button(self.ref_stop_btn, 70, 34, theme.DANGER)
-        self.ref_stop_btn.clicked.connect(self._stop_ref_record)
-        self.ref_stop_btn.setEnabled(False)
-        source_button_layout.addWidget(self.ref_stop_btn)
         self.ref_timer = QLabel("00:00.0", source_buttons)
         self.ref_timer.setFont(theme.font(14, "bold"))
         self.ref_timer.setStyleSheet(theme.label_style(theme.SUBTEXT))
         source_button_layout.addWidget(self.ref_timer)
+        # Without a level meter a reference recording gives no feedback at all:
+        # the timer runs either way, so a microphone that is picking up nothing
+        # looks exactly like a working one until the sample is rejected. This
+        # laptop's mic measures around -31 dBFS in a quiet room, which is well
+        # inside the range where a quiet voice fails the silence check.
+        self.ref_meter = MicLevelMeter(source_buttons, width=130)
+        source_button_layout.addWidget(self.ref_meter)
         self.upload_btn = QPushButton("Upload Sample…", source_buttons)
         self._style_button(self.upload_btn, 130, 34)
         self.upload_btn.clicked.connect(self._upload_sample)
@@ -459,36 +479,97 @@ class MyVoiceScreen(Screen):
             return
         try:
             recorder.start()
-            self.ref_record_btn.set_busy(True, "Recording…")
-            self.ref_stop_btn.setEnabled(True)
-            self.ref_timer.setStyleSheet(theme.label_style(theme.SUCCESS))
-            self.consent_lbl.setText("Recording reference sample… speak clearly.")
-            self.consent_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
-            self._ref_tracking = True
-            self._ref_track_timer.start()
-            self._ref_tick()
         except Exception as exc:
             self.toast(str(exc), "error")
+            return
+        # The button stays clickable so a short take can be ended by hand, but
+        # the take also ends by itself at MAX_SAMPLE_SECONDS.
+        self.ref_record_btn.set_idle_text("Stop & Use")
+        self.ref_timer.setStyleSheet(theme.label_style(theme.SUCCESS))
+        self.consent_lbl.setText(
+            "Recording… speak clearly. It stops and loads itself at "
+            f"{MAX_SAMPLE_SECONDS:.0f}s."
+        )
+        self.consent_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
+        self._ref_tracking = True
+        self._ref_peak_seen = False
+        self._ref_track_timer.start()
+        self._ref_tick()
 
     def _ref_tick(self) -> None:
         if not self._ref_tracking:
             return
-        tenths = int(self.app.recorder.elapsed() * 10)
+        recorder = self.app.recorder
+        elapsed = recorder.elapsed()
+        tenths = int(elapsed * 10)
         self.ref_timer.setText(
             f"{tenths // 600:02d}:{(tenths // 10) % 60:02d}.{tenths % 10}"
         )
+        remaining = MAX_SAMPLE_SECONDS - elapsed
+        if remaining <= 0.0:
+            # End the take by itself: the user only has to talk, never to stop.
+            self._stop_ref_record(auto=True)
+            return
+        countdown = int(remaining) + 1
+        if countdown <= 4:
+            if self._ref_peak_seen:
+                self.consent_lbl.setText(f"{countdown}s left…")
+                self.consent_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
+            else:
+                self.consent_lbl.setText(
+                    f"No sound yet — {countdown}s left. Move closer to the mic."
+                )
+                self.consent_lbl.setStyleSheet(theme.label_style(theme.DANGER, "left"))
+        # One read only: the queue holds a single level, so a second get_nowait()
+        # would always come back empty.
+        try:
+            level = recorder.level_queue.get_nowait()
+        except Exception:
+            level = None
+        if level is None:
+            return
+        self.ref_meter.push(level)
+        if level > 0.0 and not self._ref_peak_seen:
+            # Warn while recording rather than after, when the only feedback is
+            # that the sample was refused.
+            self._ref_peak_seen = True
+            self.consent_lbl.setText("Microphone is picking up sound… keep going.")
+            self.consent_lbl.setStyleSheet(theme.label_style(theme.SUCCESS, "left"))
 
-    def _stop_ref_record(self) -> None:
+    def _stop_ref_record(self, auto: bool = False) -> None:
         recorder = self.app.recorder
         if not recorder.is_recording and recorder.capture is None:
             return
         self._ref_tracking = False
         self._ref_track_timer.stop()
         recorder.stop()
-        self.ref_record_btn.set_busy(False)
-        self.ref_stop_btn.setEnabled(False)
+        self.ref_record_btn.set_idle_text("Record & Use")
+        self.ref_meter.setValue(0)
+        if not self._ref_peak_seen:
+            # The take produced no signal at all. Say so plainly instead of
+            # letting it fail later as an unexplained "silent" rejection.
+            self.toast(
+                "The microphone picked up no sound. Check the input device in "
+                "Settings > Microphone, and speak closer to the mic.",
+                "error",
+            )
+            self._ref_peak_seen = False
+            return
         if recorder.capture is None or recorder.capture.size == 0:
             self.toast("No audio captured.", "warn")
+            return
+        # Count real samples, not wall-clock time, so this matches exactly what
+        # validate_reference_sample will measure. Refusing here avoids writing a
+        # file that would be rejected a moment later.
+        duration = 0.0
+        if recorder.samplerate:
+            duration = float(recorder.capture.shape[0]) / float(recorder.samplerate)
+        if duration < MIN_SAMPLE_SECONDS:
+            self.toast(
+                f"Too short ({duration:.1f}s). Speak for at least "
+                f"{MIN_SAMPLE_SECONDS:.0f}s, then press Record & Use again.",
+                "warn",
+            )
             return
         path = file_service.unique_path(
             file_service.category_dir("voices"),
@@ -497,6 +578,12 @@ class MyVoiceScreen(Screen):
         )
         try:
             recorder.save(path, "wav")
+            if auto:
+                self.toast(
+                    f"Reached {MAX_SAMPLE_SECONDS:.0f}s — stopped and loaded "
+                    "automatically.",
+                    "ok",
+                )
             self._accept_reference(path)
         except Exception as exc:
             self.toast(str(exc), "error")
@@ -544,11 +631,20 @@ class MyVoiceScreen(Screen):
             self.consent_lbl.setStyleSheet(theme.label_style(theme.WARNING, "left"))
 
     def _create_profile(self) -> None:
+        if self._clone_disabled():
+            # Checked before anything is written: a profile created with cloning
+            # off looks successful but is never used for anything.
+            self._apply_clone_disabled_notice()
+            self.toast(
+                "Voice cloning is switched off — turn it on in Settings first.",
+                "warn",
+            )
+            return
         if not self._consent_var.get():
             self.toast("Please confirm voice-use consent first.", "warn")
             return
         if self.ref_path is None:
-            self.toast("Record or upload a voice sample first.", "warn")
+            self.toast("Press Record & Use to take a voice sample first.", "warn")
             return
         self.create_profile_btn.set_busy(True, "Creating profile…")
         try:
@@ -572,11 +668,30 @@ class MyVoiceScreen(Screen):
         finally:
             self.create_profile_btn.set_busy(False)
 
+    def _clone_disabled(self) -> bool:
+        return not self.app.settings.get("clone", "enabled", True)
+
+    def _apply_clone_disabled_notice(self) -> None:
+        """State plainly, in a persistent line, that cloning is switched off.
+
+        This used to be a toast only. A toast disappears after a few seconds, so
+        the sample would load, the profile would be written, and then nothing
+        would happen for no visible reason — which looked exactly like a
+        rejected sample. A permanent label cannot be missed.
+        """
+        self.clone_status_lbl.setText(
+            "⚠ Voice cloning is switched OFF in Settings, so nothing will be "
+            "cloned. Turn it on in Settings → Voice Cloning. The model also "
+            "still needs downloading once (~2 GB)."
+        )
+        self.clone_status_lbl.setStyleSheet(theme.label_style(theme.DANGER, "left"))
+
     def _load_clone_model(self) -> None:
-        if not self.app.settings.get("clone", "enabled", True):
+        if self._clone_disabled():
+            self._apply_clone_disabled_notice()
             self.toast(
-                "Voice cloning is off (heavy / experimental). "
-                "Enable it in Settings on a high-RAM machine to use real cloning.",
+                "Voice cloning is switched off in Settings — nothing will be "
+                "cloned until you enable it.",
                 "warn",
             )
             return
@@ -592,6 +707,9 @@ class MyVoiceScreen(Screen):
         self._refresh_clone_state()
 
     def _refresh_clone_state(self) -> None:
+        if self._clone_disabled():
+            self._apply_clone_disabled_notice()
+            return
         engine = self.app.active_cloner
         state = engine.state
         message = engine.error or {
@@ -653,10 +771,11 @@ class MyVoiceScreen(Screen):
     def _generate(self) -> None:
         if self._generating:
             return
-        if not self.app.settings.get("clone", "enabled", True):
+        if self._clone_disabled():
+            self._apply_clone_disabled_notice()
             self.toast(
-                "Voice cloning is disabled (heavy / experimental) — "
-                "using an offline system voice instead.",
+                "Voice cloning is switched off in Settings — you will get an "
+                "offline system voice instead of your own cloned voice.",
                 "warn",
             )
         if not self._consent_var.get():

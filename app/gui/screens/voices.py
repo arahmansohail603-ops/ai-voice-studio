@@ -19,7 +19,7 @@ fetched twice.
 """
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -39,12 +39,14 @@ from app.core.model_manager import human_size
 from app.core.piper_voices import (
     STAGE_DOWNLOADING,
     STAGE_INSTALLED,
+    STAGE_RETRYING,
     STAGE_VERIFYING,
+    BulkInstallResult,
     PiperVoiceLibrary,
     VoiceEntry,
 )
 from app.gui import theme
-from app.gui.widgets import Screen
+from app.gui.widgets import PROGRESS_SCALE, Screen, progress_value, ui_slot
 
 
 class _VoiceWorker(QThread):
@@ -96,6 +98,51 @@ class _CatalogWorker(QThread):
             self.failed.emit(f"Unexpected error: {exc}")
         else:
             self.loaded.emit(len(entries), len({e.language_family for e in entries}))
+
+
+class _BulkVoiceWorker(QThread):
+    """Fetches every published voice, resuming anything already half-downloaded.
+
+    The whole catalog is around 11 GB served at roughly 1 MB/s, so this runs for
+    hours. It stops between chunks, and every voice it finishes stays finished,
+    so closing the app costs nothing and re-running continues where it left off.
+    """
+
+    progressed = pyqtSignal(int, int, str, str)  # received, total, stage, label
+    done = pyqtSignal(object)  # BulkInstallResult
+
+    def __init__(self, library: PiperVoiceLibrary, entries: list[VoiceEntry]) -> None:
+        super().__init__(parent=None)
+        self._library = library
+        self._entries = entries
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+        self.requestInterruption()
+
+    def _should_cancel(self) -> bool:
+        return self._stop or self.isInterruptionRequested()
+
+    def run(self) -> None:  # pragma: no cover - exercised via the screen
+        try:
+            result = self._library.install_all(
+                self._entries,
+                on_progress=self._on_progress,
+                should_cancel=self._should_cancel,
+            )
+        except AppError as exc:
+            self.done.emit(BulkInstallResult(failed=[("(prefetch)", str(exc))]))
+            return
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.done.emit(
+                BulkInstallResult(failed=[("(prefetch)", f"Unexpected error: {exc}")])
+            )
+            return
+        self.done.emit(result)
+
+    def _on_progress(self, stage: str, received: int, total: int, label: str) -> None:
+        self.progressed.emit(received, total, stage, label)
 
 
 class _VoiceRow(QFrame):
@@ -166,8 +213,8 @@ class _VoiceRow(QFrame):
 
     def set_progress(self, received: int, total: int) -> None:
         self.bar.setVisible(True)
-        self.bar.setRange(0, max(1, total))
-        self.bar.setValue(received)
+        self.bar.setRange(0, PROGRESS_SCALE)
+        self.bar.setValue(progress_value(received, total))
 
     def set_busy(self, busy: bool, stage: str = "") -> None:
         """Lock the row while a download owns it."""
@@ -258,6 +305,8 @@ class VoicesScreen(Screen):
         self._groups: dict[str, _LanguageGroup] = {}
         self._workers: dict[str, _VoiceWorker] = {}
         self._catalog_worker: _CatalogWorker | None = None
+        self._bulk_worker: _BulkVoiceWorker | None = None
+        self._prefetch_requested = False
         self._filter = ""
 
         root = QVBoxLayout(self)
@@ -312,6 +361,42 @@ class VoicesScreen(Screen):
         self.refresh_btn.clicked.connect(lambda: self._load_catalog(refresh=True))
         controls.addWidget(self.refresh_btn)
         root.addLayout(controls)
+        root.addSpacing(8)
+
+        bulk = QHBoxLayout()
+        bulk.setSpacing(8)
+
+        self.download_all_btn = QPushButton("Download all voices", self)
+        self.download_all_btn.setFixedHeight(32)
+        self.download_all_btn.setFont(theme.font(12))
+        self.download_all_btn.setStyleSheet(
+            theme.button_style(theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 6, theme.BORDER, 1)
+        )
+        self.download_all_btn.clicked.connect(self._on_download_all)
+        self.download_all_btn.setEnabled(False)
+        bulk.addWidget(self.download_all_btn)
+
+        self.stop_all_btn = QPushButton("Stop", self)
+        self.stop_all_btn.setFixedSize(90, 32)
+        self.stop_all_btn.setFont(theme.font(12))
+        self.stop_all_btn.setStyleSheet(
+            theme.button_style(theme.INPUT_BG, theme.CARD_BG, theme.TEXT, 6, theme.BORDER, 1)
+        )
+        self.stop_all_btn.clicked.connect(self._on_stop_all)
+        self.stop_all_btn.setVisible(False)
+        bulk.addWidget(self.stop_all_btn)
+
+        self.bulk_bar = QProgressBar(self)
+        self.bulk_bar.setFixedHeight(18)
+        self.bulk_bar.setTextVisible(False)
+        self.bulk_bar.setVisible(False)
+        bulk.addWidget(self.bulk_bar, 1)
+
+        self.bulk_status = QLabel("", self)
+        self.bulk_status.setFont(theme.font(11))
+        self.bulk_status.setStyleSheet(theme.label_style(theme.SUBTEXT, "left"))
+        bulk.addWidget(self.bulk_status)
+        root.addLayout(bulk)
         root.addSpacing(10)
 
         scroll = QScrollArea(self)
@@ -353,7 +438,11 @@ class VoicesScreen(Screen):
         if not self._entries:
             self._load_catalog(refresh=False)
         else:
+            self._update_bulk_button()
             self._rebuild()
+        if kwargs.get("prefetch"):
+            # Arrived from the first-run offer, so start without asking again.
+            self.request_prefetch()
 
     # --------------------------------------------------------------- loading
     def _load_catalog(self, refresh: bool) -> None:
@@ -373,9 +462,13 @@ class VoicesScreen(Screen):
         self._catalog_worker.finished.connect(self._on_catalog_finished)
         self._catalog_worker.start()
 
+    @ui_slot
     def _on_catalog_loaded(self, voices: int, languages: int) -> None:
         self._entries = self._library.catalog_from_cache()
+        self._update_bulk_button()
         self._rebuild()
+        if self._prefetch_requested:
+            self.start_prefetch()
         installed = len(self._library.installed())
         self._show_message(
             f"{voices} voices in {languages} languages  ·  "
@@ -383,12 +476,16 @@ class VoicesScreen(Screen):
             theme.SUBTEXT,
         )
 
+    @ui_slot
     def _on_catalog_failed(self, message: str) -> None:
         # A cached catalog still works offline, so fall back rather than dead-end.
         cached = self._library.catalog_from_cache()
         if cached:
             self._entries = cached
+            self._update_bulk_button()
             self._rebuild()
+            if self._prefetch_requested:
+                self.start_prefetch()
             self._show_message(
                 f"Working offline from the saved voice list. ({message})",
                 theme.WARNING,
@@ -396,9 +493,154 @@ class VoicesScreen(Screen):
         else:
             self._show_message(message, theme.DANGER)
 
+    @ui_slot
     def _on_catalog_finished(self) -> None:
         self.refresh_btn.setEnabled(True)
         self._catalog_worker = None
+
+    # ------------------------------------------------------------ bulk prefetch
+    @property
+    def prefetching(self) -> bool:
+        return self._bulk_worker is not None and self._bulk_worker.isRunning()
+
+    def _update_bulk_button(self) -> None:
+        """Label the button with the work genuinely left, not the whole catalog."""
+        if self.prefetching:
+            return
+        if not self._entries:
+            self.download_all_btn.setEnabled(False)
+            self.download_all_btn.setText("Download all voices")
+            return
+        count, total = self._library.remaining(self._entries)
+        if count <= 0:
+            self.download_all_btn.setEnabled(False)
+            self.download_all_btn.setText("Every voice is installed")
+            return
+        self.download_all_btn.setEnabled(True)
+        self.download_all_btn.setText(
+            f"Download all ({count} left  ·  {human_size(total)})"
+        )
+
+    @ui_slot
+    def _on_download_all(self) -> None:
+        if self.prefetching or not self._entries:
+            return
+        count, total = self._library.remaining(self._entries)
+        if count <= 0:
+            self._update_bulk_button()
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Download every voice",
+            f"Download the {count} voices that are still missing "
+            f"({human_size(total)})?\n\n"
+            "The download runs in the background, keeps its place if the "
+            "connection drops, and can be stopped at any time. Voices you "
+            "already have are not downloaded again.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self.start_prefetch()
+
+    def request_prefetch(self) -> None:
+        """Start the bulk download, waiting for the catalog if it is still loading."""
+        self._prefetch_requested = True
+        if self._entries and not self.prefetching:
+            self.start_prefetch()
+
+    def start_prefetch(self) -> None:
+        if self.prefetching or not self._entries:
+            return
+        self._prefetch_requested = False
+        _, total = self._library.remaining(self._entries)
+        self.download_all_btn.setEnabled(False)
+        self.stop_all_btn.setVisible(True)
+        self.bulk_bar.setVisible(True)
+        self.bulk_bar.setRange(0, PROGRESS_SCALE)
+        self.bulk_bar.setValue(0)
+        for group in self._groups.values():
+            group.set_busy(True, STAGE_DOWNLOADING)
+        # Written once here rather than on every progress tick, which would
+        # rewrite the shared header thousands of times over the whole catalog.
+        self._show_message(
+            f"Downloading every voice ({human_size(total)}). This can take "
+            "hours; it keeps its place if the connection drops, and you can "
+            "stop it at any time.",
+            theme.SUBTEXT,
+        )
+
+        worker = _BulkVoiceWorker(self._library, list(self._entries))
+        worker.progressed.connect(self._on_bulk_progress)
+        worker.done.connect(self._on_bulk_done)
+        worker.finished.connect(self._on_bulk_finished)
+        self._bulk_worker = worker
+        worker.start()
+
+    @ui_slot
+    def _on_stop_all(self) -> None:
+        worker = self._bulk_worker
+        if worker is None:
+            return
+        self.stop_all_btn.setEnabled(False)
+        self.bulk_status.setText("Stopping after this voice…")
+        worker.stop()
+
+    @ui_slot
+    def _on_bulk_progress(
+        self, received: int, total: int, stage: str, label: str
+    ) -> None:
+        self.bulk_bar.setRange(0, PROGRESS_SCALE)
+        self.bulk_bar.setValue(progress_value(received, total))
+        done = human_size(received)
+        whole = human_size(total)
+        # Say so while a flaky connection is being retried. Over an hours-long
+        # transfer a stalled bar is indistinguishable from a hung app, and the
+        # user has no way to tell whether to wait or to give up.
+        note = "  retrying connection..." if stage == STAGE_RETRYING else ""
+        self.bulk_status.setText(f"{done} of {whole}  ·  {label}{note}")
+        # Deliberately no _show_message() here. The header is shared with the
+        # voice list and every other tab, and this slot runs once per chunk, so
+        # an 11 GB download would rewrite it thousands of times. The running
+        # totals belong to the status line under the progress bar, and the
+        # explanation is written once when the run starts.
+
+    @ui_slot
+    def _on_bulk_done(self, result: BulkInstallResult) -> None:
+        message = result.summary()
+        if result.cancelled:
+            self._show_message(message, theme.WARNING)
+        elif result.failed:
+            self._show_message(message, theme.DANGER)
+        else:
+            self._show_message(message, theme.SUCCESS)
+        self.bulk_status.setText(message)
+        refresh = getattr(self.app, "tts", None)
+        if refresh is not None and hasattr(refresh, "refresh_voices_async"):
+            refresh.refresh_voices_async(lambda: None)
+
+    def shutdown(self) -> None:
+        # Stop the bulk download and let the thread unwind. Leaving it running
+        # would destroy a running QThread with the window and abort the process.
+        # Everything already fetched stays on disk, so the next launch resumes.
+        worker = self._bulk_worker
+        if worker is None:
+            return
+        worker.stop()
+        worker.wait(5000)
+
+    @ui_slot
+    def _on_bulk_finished(self) -> None:
+        self._bulk_worker = None
+        self.stop_all_btn.setEnabled(True)
+        self.stop_all_btn.setVisible(False)
+        self.bulk_bar.setVisible(False)
+        self.bulk_status.setText("")
+        for group in self._groups.values():
+            group.set_busy(False)
+        self._update_bulk_button()
+        self._rebuild()
 
     # -------------------------------------------------------------- rendering
     def _clear_rows(self) -> None:
@@ -419,7 +661,9 @@ class VoicesScreen(Screen):
         return needle in haystack
 
     def _rebuild(self) -> None:
-        if any(worker.isRunning() for worker in self._workers.values()):
+        if self.prefetching or any(
+            worker.isRunning() for worker in self._workers.values()
+        ):
             # Do not tear down rows out from under a running download.
             return
 
@@ -449,6 +693,7 @@ class VoicesScreen(Screen):
             self._body.addWidget(group)
         self._body.addStretch(1)
 
+    @ui_slot
     def _on_filter(self, *_args) -> None:
         # The box is the source of truth for the filter; a language passed to
         # on_show writes into the box, so both routes stay in step.
@@ -499,7 +744,21 @@ class VoicesScreen(Screen):
         return group.voice_rows.get(key) if group else None
 
     # ---------------------------------------------------------------- actions
+    @ui_slot
     def _on_download(self, key: str) -> None:
+        # A failure re-enables the row's button from _on_failed, which runs
+        # before this worker's queued `finished` has been delivered. Without
+        # this guard a second click started a second install for the same voice
+        # writing the same directory concurrently, and overwrote the entry in
+        # _workers -- so the still-running QThread lost its last Python
+        # reference and aborted the process. The Models screen already guards
+        # the same way.
+        if self.prefetching:
+            # The bulk run is already fetching this voice's files; a second
+            # writer on the same directory would corrupt the partial file.
+            return
+        if key in self._workers:
+            return
         entry = next((e for e in self._entries if e.key == key), None)
         if entry is None:
             return
@@ -521,6 +780,7 @@ class VoicesScreen(Screen):
         self._workers[key] = worker
         worker.start()
 
+    @ui_slot
     def _on_delete(self, key: str) -> None:
         entry = next((e for e in self._entries if e.key == key), None)
         if entry is None or not self._library.is_installed(entry):
@@ -547,6 +807,7 @@ class VoicesScreen(Screen):
         if refresh is not None and hasattr(refresh, "refresh_voices_async"):
             refresh.refresh_voices_async(lambda: None)
 
+    @ui_slot
     def _on_progress(self, key: str, received: int, total: int, stage: str, detail: str) -> None:
         row = self._row_for(key)
         group = self._group_for(key)
@@ -560,6 +821,7 @@ class VoicesScreen(Screen):
         elif stage == STAGE_INSTALLED:
             self._show_message("Installed.", theme.SUBTEXT)
 
+    @ui_slot
     def _on_succeeded(self, key: str, stem: str) -> None:
         self._show_message(f"Installed {stem}.", theme.SUCCESS)
         self._rebuild()
@@ -567,6 +829,7 @@ class VoicesScreen(Screen):
         if refresh is not None and hasattr(refresh, "refresh_voices_async"):
             refresh.refresh_voices_async(lambda: None)
 
+    @ui_slot
     def _on_failed(self, key: str, message: str) -> None:
         self._show_message(message, theme.DANGER)
         row = self._row_for(key)
@@ -576,3 +839,66 @@ class VoicesScreen(Screen):
     def _on_worker_done(self, key: str) -> None:
         self._workers.pop(key, None)
         self._rebuild()
+
+
+def prefetch_already_offered() -> bool:
+    """True once the one-time offer has been made, so it is never asked twice."""
+    from app.config import PIPER_PREFETCH_MARKER
+
+    try:
+        return PIPER_PREFETCH_MARKER.exists()
+    except OSError:
+        return True
+
+
+def offer_bulk_prefetch(app) -> None:
+    """Offer the one-time "fetch every voice" download, once, on first run.
+
+    Must run on the UI thread: it shows a modal question and navigates. It reads
+    the cached catalog, so the caller warms the cache in the background first --
+    otherwise a fresh install, which is the only install this is for, would have
+    nothing cached and would never ask. It also asks rather than just starting,
+    because the full set is around 11 GB and silently spending that on a metered
+    connection is not a reasonable default.
+    """
+    from app.config import PIPER_PREFETCH_MARKER
+
+    if prefetch_already_offered():
+        return
+
+    library = PiperVoiceLibrary()
+    try:
+        entries = library.catalog_from_cache()
+    except OSError:
+        return
+    if not entries:
+        return
+
+    try:
+        count, total = library.remaining(entries)
+    except OSError:
+        return
+    try:
+        PIPER_PREFETCH_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        PIPER_PREFETCH_MARKER.write_text("offered\n", encoding="utf-8")
+    except OSError:
+        # A read-only data folder just means we may ask again next time.
+        pass
+
+    if count <= 0:
+        return
+
+    answer = QMessageBox.question(
+        None,
+        "Download every voice now?",
+        f"{count} Piper voices are not installed yet "
+        f"({human_size(total)} in total).\n\n"
+        "Downloading them all now means every language the app can speak "
+        "works offline straight away, with no per-voice download later. "
+        "It runs in the background, keeps its place if the connection drops, "
+        "and you can stop it at any time.",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.No,
+    )
+    if answer == QMessageBox.Yes:
+        app.show_screen("voices", prefetch=True)

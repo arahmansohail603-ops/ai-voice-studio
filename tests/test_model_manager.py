@@ -16,10 +16,11 @@ from tempfile import TemporaryDirectory
 from typing import ClassVar
 
 from app.core import model_catalog as mc
-from app.core.errors import AppError, ModelError, ModelNotInstalledError
+from app.core.errors import ModelError, ModelNotInstalledError
 from app.core.model_manager import (
     STAGE_DOWNLOADING,
     STAGE_INSTALLED,
+    DownloadCancelled,
     ModelManager,
     extract_zip,
     free_bytes,
@@ -535,12 +536,32 @@ class ModelManagerTests(unittest.TestCase):
         self.assertFalse(part0.exists())
 
     def test_cancel_stops_the_install(self) -> None:
+        """Cancel aborts the attempt in flight, and only that attempt.
+
+        The cancel is raised from inside the download, which is the only place
+        the Cancel button can fire it from. The second half is the part that used
+        to be broken: cancelling is a latch on the shared manager, and nothing
+        cleared it, so every later install -- any model, for the rest of the
+        session -- raised before fetching a byte and the only recovery was
+        restarting the app.
+        """
         self.manager.refresh()
-        self.manager.cancel()
-        with self.assertRaises(AppError):
+        real_part = self.manager._download_part
+        armed = []
+
+        def cancel_midway(*args, **kwargs):
+            if not armed:
+                armed.append(True)
+                self.manager.cancel()  # the user hits Cancel mid-download
+            return real_part(*args, **kwargs)
+
+        self.manager._download_part = cancel_midway
+        with self.assertRaises(DownloadCancelled):
             self.manager.install("vosk-en-us-0.15")
         self.assertFalse(self.manager.is_installed("vosk-en-us-0.15"))
-        self.manager.reset_cancel()
+
+        # No manual reset between attempts: install() defines the attempt
+        # boundary by taking the download lock, and clears the latch there.
         self.manager.install("vosk-en-us-0.15")
         self.assertTrue(self.manager.is_installed("vosk-en-us-0.15"))
 
