@@ -1,0 +1,18 @@
+{
+  "services": {
+    "ai-voice-studio-license": {
+      "root": "server",
+      "entrypoint": "config.wsgi:application",
+      "buildCommand": "pip install -r requirements.txt && python manage.py collectstatic --noinput"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "type": "service",
+        "service": "ai-voice-studio-license"
+      }
+    }
+  ]
+}
