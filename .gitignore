@@ -35,3 +35,6 @@ Thumbs.db
 *.log
 .vercel
 .env*
+
+# Generated full-source dump (concatenation of all project files)
+project_code.txt
