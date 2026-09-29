@@ -311,12 +311,14 @@ def _nuitka_command(
         # stdlib, so they add no dependency weight.
         "--include-module=app.core.model_catalog",
         "--include-module=app.core.model_manager",
-        "--include-qt-plugins",
+        "--enable-plugin=pyqt5",
         f"--output-dir={output_dir}",
         f"--output-filename={build_target()}",
         "--company-name=AI Voice Studio",
         "--product-name=AI Voice Studio",
         "--file-description=AI Voice Studio",
+        "--file-version=1.0.0",
+        "--product-version=1.0.0",
     ]
     command.extend(keyring_options)
     if include_optional:
@@ -331,6 +333,20 @@ def _nuitka_command(
         ):
             if _module_available(module):
                 command.append(f"--include-package={module}")
+    else:
+        # Optional AI/ASR/translation packages are imported lazily at runtime
+        # and are not part of the light distribution. Keep the optimizer out of
+        # their sources entirely (torch crashes Nuitka's optimizer).
+        for module in (
+            "argostranslate",
+            "piper",
+            "qwen_tts",
+            "torch",
+            "TTS",
+            "vosk",
+            "whisper",
+        ):
+            command.append(f"--nofollow-import-to={module}")
     if ASSETS.is_dir():
         command.append(f"--include-data-dir={ASSETS}=assets")
     # The bundled (development) model catalog is read at runtime via

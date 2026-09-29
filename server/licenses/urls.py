@@ -1,8 +1,15 @@
 from django.urls import path
 
-from .views import ActivationView, HealthView, StatusView, ValidateView
+from .views import (
+    ActivationView,
+    HealthView,
+    LandingView,
+    StatusView,
+    ValidateView,
+)
 
 urlpatterns = [
+    path("", LandingView.as_view(), name="landing"),
     path("health/", HealthView.as_view(), name="health"),
     path("api/v1/health/", HealthView.as_view(), name="api-health"),
     path(

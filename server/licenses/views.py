@@ -155,3 +155,43 @@ class HealthView(APIView):
             "version": 1,
         }
         return _response(canonical_json(payload))
+
+
+class LandingView(APIView):
+    authentication_classes: ClassVar[list] = []
+    permission_classes: ClassVar[list] = [AllowAny]
+
+    def get(self, request):
+        html = (
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>AI Voice Studio License Server</title><style>"
+            "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
+            "background:#0f172a;color:#e2e8f0;margin:0;display:flex;"
+            "min-height:100vh;align-items:center;justify-content:center}"
+            ".card{background:#1e293b;border:1px solid #334155;border-radius:16px;"
+            "padding:40px 48px;max-width:560px;text-align:center;box-shadow:"
+            "0 20px 40px rgba(0,0,0,.4)}h1{font-size:26px;margin:0 0 8px;"
+            "color:#f8fafc}code{background:#0f172a;padding:2px 8px;border-radius:6px;"
+            "color:#7dd3fc}.status{display:inline-flex;align-items:center;gap:8px;"
+            "color:#4ade80;font-weight:600;margin:16px 0} .dot{width:10px;height:10px;"
+            "border-radius:50%;background:#4ade80;animation:pulse 2s infinite}"
+            "@keyframes pulse{50%{opacity:.3}}p{font-size:14px;color:#94a3b8;"
+            "margin:6px 0}.links{margin-top:20px;display:flex;gap:12px;"
+            "justify-content:center;flex-wrap:wrap}.links a{color:#38bdf8;"
+            "text-decoration:none;font-size:14px;border:1px solid #334155;"
+            "border-radius:8px;padding:8px 14px} .links a:hover{background:#334155}"
+            "</style></head><body><div class='card'>"
+            "<h1>AI Voice Studio</h1>"
+            "<div class='status'><span class='dot'></span>License server is running</div>"
+            "<p>Service: <code>license-server</code></p>"
+            "<p>Signing key: <code>local-v1</code></p>"
+            "<div class='links'>"
+            "<a href='health/'>Health</a>"
+            "<a href='api/v1/health/'>API Health</a>"
+            "</div></div></body></html>"
+        )
+        response = HttpResponse(html, status=200, content_type="text/html")
+        response["Cache-Control"] = "no-store"
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
