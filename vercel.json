@@ -3,7 +3,7 @@
     "ai-voice-studio-license": {
       "root": "server",
       "entrypoint": "config.wsgi:application",
-      "buildCommand": "pip install -r requirements.txt && python manage.py collectstatic --noinput"
+      "buildCommand": "pip install --break-system-packages -r requirements.txt && python manage.py collectstatic --noinput"
     }
   },
   "rewrites": [
