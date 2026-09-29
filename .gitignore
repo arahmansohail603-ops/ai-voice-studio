@@ -25,6 +25,9 @@ app/_build_license_config.py
 # Local development trust configuration for the desktop launcher
 scripts/license-dev.env
 
+# License key issued by scripts/setup-dev.ps1 (per machine, never committed)
+LICENSE-KEY.txt
+
 # IDE / OS
 .vscode/
 .idea/

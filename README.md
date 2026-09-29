@@ -8,6 +8,28 @@ The audio features are designed to run locally without cloud AI services or API 
 The application is commercially licensed: activation and periodic lease validation
 require a configured license server.
 
+## Quick start
+
+No account, cloud service or API key is required. From a fresh clone, in
+PowerShell:
+
+```powershell
+# 1. one-time setup: virtualenvs, signing keys, local license server, your key
+powershell -ExecutionPolicy Bypass -File scripts\setup-dev.ps1
+
+# 2. start the app
+powershell -ExecutionPolicy Bypass -File scripts\start-app.ps1
+```
+
+`setup-dev.ps1` creates both virtual environments, generates a signing key pair
+for your machine, writes the local license server configuration, migrates its
+database and issues a license key bound to your computer. No secret is ever
+committed: the private key stays in `server\.env` and the issued key in
+`LICENSE-KEY.txt`, both git-ignored.
+
+See [SETUP_FOR_REVIEWER.md](SETUP_FOR_REVIEWER.md) for the full walkthrough,
+optional offline engines and troubleshooting.
+
 ## Features
 
 | Feature | Details |
