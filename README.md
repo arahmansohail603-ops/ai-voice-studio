@@ -30,6 +30,10 @@ committed: the private key stays in `server\.env` and the issued key in
 See [SETUP_FOR_REVIEWER.md](SETUP_FOR_REVIEWER.md) for the full walkthrough,
 optional offline engines and troubleshooting.
 
+Sending the app to someone to try? [TESTING_FOR_REVIEWER.md](TESTING_FOR_REVIEWER.md)
+has a ready-to-send message, a "what works immediately" table and a UI test
+checklist.
+
 ## Features
 
 | Feature | Details |
